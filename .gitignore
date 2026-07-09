@@ -1,0 +1,96 @@
+﻿# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============================================================
+# Ambiente / credenciais
+# ============================================================
+.env
+.env.*
+!.env.example
+
+# ============================================================
+# Virtual environments
+# ============================================================
+venv/
+.venv/
+env/
+ENV/
+
+# ============================================================
+# Logs / temporários
+# ============================================================
+*.log
+*.tmp
+*.bak
+*.backup
+*.orig
+
+# Arquivos temporários do Excel
+~$*
+
+# ============================================================
+# Dados gerados do DOU
+# Mantém somente backend/data/dou/.gitkeep
+# ============================================================
+backend/data/dou/*
+!backend/data/dou/.gitkeep
+
+# ============================================================
+# Cloudflare / Wrangler
+# ============================================================
+cloudflare_deploy_dou_integras/
+.wrangler/
+wrangler.jsonc
+
+# ============================================================
+# Backups e scripts temporários
+# ============================================================
+backup_*/
+*_bkp_*
+*.bkp_*
+
+ajustar_*.py
+criar_*.py
+listar_*.py
+reenviar_*.py
+testar_*.py
+rodar_teste_*.py
+rodar_0107_*.py
+enviar_email_*.py
+diagnostico_*.py
+gerar_html_*.py
+ver_integra_*.html
+preview_*.html
+saida_*.txt
+estrutura_projeto.txt
+
+# ============================================================
+# Sistema operacional / editor
+# ============================================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ============================================================
+# Dados auxiliares / diagnosticos gerados
+# ============================================================
+backend/data/diagnosticos/
+backend/data/publicacoes_padrao/
+
+# ============================================================
+# Outputs gerados
+# Mantem somente arquivos .gitkeep
+# ============================================================
+backend/output/**
+!backend/output/
+!backend/output/**/
+!backend/output/**/.gitkeep

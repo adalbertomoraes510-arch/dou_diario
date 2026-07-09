@@ -1,0 +1,14 @@
+{
+  "finalidade_config": "informativos",
+  "nome_exibicao": "Informativos",
+  "descricao": "Finalidade global para monitoramento de informativos em m?ltiplas fontes.",
+  "ativo": true,
+  "modelo_planilha": "simples_coluna_unica_v1",
+  "fontes_habilitadas": [
+    "dou",
+    "anvisa",
+    "inmetro"
+  ],
+  "arquivo_palavras_chave": "palavras_chave.xlsx",
+  "arquivo_exclusoes": "exclusoes.xlsx"
+}

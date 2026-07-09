@@ -1,0 +1,8 @@
+{
+  "finalidade_config": "dou_diario",
+  "nome_exibicao": "DOU Di?rio",
+  "descricao": "Finalidade atual migrada para a nova estrutura de finalidades.",
+  "ativo": true,
+  "arquivo_palavras_chave": "palavras_chave.xlsx",
+  "arquivo_exclusoes": "exclusoes.xlsx"
+}
