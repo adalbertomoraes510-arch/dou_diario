@@ -30,8 +30,8 @@ from backend.services.email_dou_diario_service import (
 # Para rodar perÃ­odo especÃ­fico, altere manualmente, por exemplo:
 #DATA_INICIO = datetime.date(2026, 4, 23)
 #DATA_FIM = datetime.date(2026, 4, 30)
-DATA_INICIO = datetime.date(2026, 7, 8)
-DATA_FIM = datetime.date(2026, 7, 8)
+DATA_INICIO = None
+DATA_FIM = None
 
 FINALIDADES_CONFIG = [
     "dou_diario",
@@ -1342,3 +1342,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
