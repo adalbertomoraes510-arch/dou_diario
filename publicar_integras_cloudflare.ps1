@@ -26,6 +26,11 @@ function Get-DotEnvValue {
 
     $valor = $linha -replace ("^\s*" + [regex]::Escape($Key) + "\s*=\s*"), ""
     $valor = $valor.Trim().Trim('"').Trim("'")
+
+    if ([string]::IsNullOrWhiteSpace($valor)) {
+        return $DefaultValue
+    }
+
     return $valor
 }
 
@@ -48,15 +53,15 @@ if (-not (Test-Path $origemIntegras)) {
 
 Copy-Item $origemIntegras $siteDir -Recurse -Force
 
-$wranglerConfig = @(
-'{',
-'  "name": "' + $workerName + '",',
-'  "compatibility_date": "2026-07-08",',
-'  "assets": {',
-'    "directory": "./site"',
-'  }',
-'}'
-)
+$wranglerConfig = @"
+{
+  "name": "$workerName",
+  "compatibility_date": "2026-07-08",
+  "assets": {
+    "directory": "./site"
+  }
+}
+"@
 
 $wranglerConfig | Set-Content -Encoding UTF8 "$deployRoot\wrangler.jsonc"
 
@@ -65,6 +70,10 @@ cd $deployRoot
 Write-Host "Publicando no Cloudflare..." -ForegroundColor Cyan
 
 npx wrangler deploy
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Falha no deploy Cloudflare. npx wrangler deploy retornou codigo $LASTEXITCODE."
+}
 
 Write-Host ""
 Write-Host "Deploy Cloudflare concluido." -ForegroundColor Green
