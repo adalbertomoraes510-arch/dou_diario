@@ -69,13 +69,14 @@ cd $deployRoot
 
 Write-Host "Publicando no Cloudflare..." -ForegroundColor Cyan
 
-npx wrangler deploy
+npx -y wrangler deploy
 
 if ($LASTEXITCODE -ne 0) {
-    throw "Falha no deploy Cloudflare. npx wrangler deploy retornou codigo $LASTEXITCODE."
+    throw "Falha no deploy Cloudflare. npx -y wrangler deploy retornou codigo $LASTEXITCODE."
 }
 
 Write-Host ""
 Write-Host "Deploy Cloudflare concluido." -ForegroundColor Green
 Write-Host "URL base:"
 Write-Host $baseUrl
+
