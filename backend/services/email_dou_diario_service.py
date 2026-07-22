@@ -30,6 +30,9 @@ from pathlib import Path
 from typing import Any
 
 from backend.services.email_service import enviar_email
+from backend.services.controle_email_processos_service import (
+    obter_ocorrencias_pendentes,
+)
 
 try:
     from backend.services.dou_link_resolver_service import resolver_links_modernos_dou_lote
@@ -695,6 +698,283 @@ def carregar_publicacoes_relevantes(data_execucao: datetime.date) -> list[dict]:
 
 
 # ============================================================
+# OCORRÊNCIAS PENDENTES — PROCESSOS MONITORADOS
+# ============================================================
+
+def primeiro_valor_ocorrencia(
+    ocorrencia: dict,
+    chaves: list[str],
+    padrao: Any = "",
+) -> Any:
+    for chave in chaves:
+        valor = ocorrencia.get(chave)
+
+        if valor not in [None, "", [], {}]:
+            return valor
+
+    return padrao
+
+
+def selecionar_url_ocorrencia_processo(ocorrencia: dict) -> str:
+    fonte = normalizar_texto_busca(
+        ocorrencia.get("fonte")
+        or ocorrencia.get("origem")
+    )
+
+    if "anvisa" in fonte:
+        chaves = [
+            "url_item",
+            "url_pdf",
+            "url",
+            "link",
+        ]
+    else:
+        chaves = [
+            "url_publicacao_web",
+            "url_web_dou",
+            "url_publicacao",
+            "url_pagina_dou",
+            "url_consulta_dou",
+            "url",
+            "link",
+            "href",
+        ]
+
+    for chave in chaves:
+        valor = str(ocorrencia.get(chave) or "").strip()
+
+        if valor:
+            return valor
+
+    return ""
+
+
+def normalizar_ocorrencia_processo_email(
+    ocorrencia: dict,
+) -> dict:
+    processo = normalizar_texto(
+        primeiro_valor_ocorrencia(
+            ocorrencia,
+            ["processo", "valor_encontrado"],
+        )
+    )
+
+    fonte = normalizar_texto(
+        primeiro_valor_ocorrencia(
+            ocorrencia,
+            ["fonte", "origem"],
+            "MONITORAMENTO DE PROCESSOS",
+        )
+    )
+
+    titulo = normalizar_texto(
+        primeiro_valor_ocorrencia(
+            ocorrencia,
+            [
+                "titulo",
+                "titulo_publicacao",
+                "ementa",
+                "nome_documento",
+            ],
+            "Ocorrência de processo monitorado",
+        )
+    )
+
+    orgao = normalizar_texto(
+        primeiro_valor_ocorrencia(
+            ocorrencia,
+            ["orgao", "órgão", "orgao_publicacao"],
+            fonte,
+        )
+    )
+
+    data_publicacao = normalizar_texto(
+        primeiro_valor_ocorrencia(
+            ocorrencia,
+            ["data_publicacao", "data"],
+        )
+    )
+
+    secao = normalizar_texto(
+        primeiro_valor_ocorrencia(
+            ocorrencia,
+            ["secao", "seção"],
+        )
+    )
+
+    pagina = normalizar_texto(
+        primeiro_valor_ocorrencia(
+            ocorrencia,
+            ["pagina", "página", "pagina_pdf"],
+        )
+    )
+
+    trecho = normalizar_texto(
+        primeiro_valor_ocorrencia(
+            ocorrencia,
+            [
+                "trecho",
+                "trecho_encontrado",
+                "contexto",
+                "texto_referencia",
+            ],
+        )
+    )
+
+    url = selecionar_url_ocorrencia_processo(ocorrencia)
+    chave_email = str(ocorrencia.get("chave_email") or "").strip()
+
+    registro_original = dict(ocorrencia)
+    registro_original["processos_monitorados_detectados"] = (
+        [processo] if processo else []
+    )
+
+    return {
+        "titulo": titulo,
+        "orgao": orgao,
+        "url": url,
+        "url_original": url,
+        "url_publicacao_web": str(
+            ocorrencia.get("url_publicacao_web") or ""
+        ).strip(),
+        "url_web_dou": str(
+            ocorrencia.get("url_web_dou") or ""
+        ).strip(),
+        "url_publicacao": str(
+            ocorrencia.get("url_publicacao") or ""
+        ).strip(),
+        "url_pagina_dou": str(
+            ocorrencia.get("url_pagina_dou") or ""
+        ).strip(),
+        "url_consulta_dou": str(
+            ocorrencia.get("url_consulta_dou") or ""
+        ).strip(),
+        "url_item": str(
+            ocorrencia.get("url_item") or ""
+        ).strip(),
+        "url_pdf": str(
+            ocorrencia.get("url_pdf") or ""
+        ).strip(),
+        "link": str(
+            ocorrencia.get("link") or ""
+        ).strip(),
+        "href": str(
+            ocorrencia.get("href") or ""
+        ).strip(),
+        "data_publicacao": data_publicacao,
+        "secao": secao,
+        "pagina": pagina,
+        "jornal": str(
+            ocorrencia.get("jornal") or ""
+        ).strip(),
+        "arquivo_xml": str(
+            ocorrencia.get("arquivo_xml") or ""
+        ).strip(),
+        "zip": str(
+            ocorrencia.get("zip") or ""
+        ).strip(),
+        "termos": [processo] if processo else [],
+        "processos_detectados": [processo] if processo else [],
+        "texto_referencia": trecho,
+        "trecho_relevante": trecho,
+        "trecho_relevante_html": destacar_termos_no_trecho_html(
+            trecho=trecho,
+            termos=[processo] if processo else [],
+        ),
+        "registro_original": registro_original,
+        "ocorrencia_processo_incremental": True,
+        "chave_email_ocorrencia": chave_email,
+        "fonte_monitoramento": fonte,
+    }
+
+
+def carregar_publicacoes_processos_pendentes() -> tuple[list[dict], list[str]]:
+    ocorrencias = obter_ocorrencias_pendentes()
+
+    publicacoes: list[dict] = []
+    chaves: list[str] = []
+
+    for ocorrencia in ocorrencias:
+        if not isinstance(ocorrencia, dict):
+            continue
+
+        publicacao = normalizar_ocorrencia_processo_email(
+            ocorrencia
+        )
+        publicacoes.append(publicacao)
+
+        chave_email = str(
+            ocorrencia.get("chave_email") or ""
+        ).strip()
+
+        if chave_email and chave_email not in chaves:
+            chaves.append(chave_email)
+
+    return publicacoes, chaves
+
+
+def chave_deduplicacao_publicacao_processo(
+    publicacao: dict,
+) -> str:
+    processos = remover_duplicados_preservando_ordem(
+        publicacao.get("processos_detectados", []) or []
+    )
+
+    if not processos:
+        processos = extrair_processos_publicacao(publicacao)
+
+    processo = processos[0] if processos else ""
+
+    titulo = normalizar_chave_comparacao(
+        publicacao.get("titulo")
+    )
+    pagina = normalizar_chave_comparacao(
+        publicacao.get("pagina")
+    )
+    data_publicacao = normalizar_chave_comparacao(
+        publicacao.get("data_publicacao")
+    )
+
+    url = normalizar_chave_comparacao(
+        selecionar_url_publicacao(publicacao)
+        or publicacao.get("url_pdf")
+        or publicacao.get("url_item")
+    )
+
+    return "|".join([
+        normalizar_chave_comparacao(processo),
+        data_publicacao,
+        titulo,
+        pagina,
+        url,
+    ])
+
+
+def combinar_publicacoes_com_processos_pendentes(
+    publicacoes_tradicionais: list[dict],
+    publicacoes_processos: list[dict],
+) -> list[dict]:
+    combinadas = list(publicacoes_tradicionais)
+    chaves_existentes = {
+        chave_deduplicacao_publicacao_processo(publicacao)
+        for publicacao in publicacoes_tradicionais
+        if eh_processo_monitorado(publicacao)
+    }
+
+    for publicacao in publicacoes_processos:
+        chave = chave_deduplicacao_publicacao_processo(
+            publicacao
+        )
+
+        if chave and chave in chaves_existentes:
+            continue
+
+        combinadas.append(publicacao)
+
+        if chave:
+            chaves_existentes.add(chave)
+
+    return combinadas
 
 
 # ============================================================
@@ -732,15 +1012,21 @@ def anexar_links_integras_publicacoes(
     data_execucao: datetime.date,
 ) -> list[dict]:
     """
-    Gera os HTMLs/TXTs de íntegra e associa cada publicação do e-mail
-    ao respectivo HTML.
+    Gera os HTMLs/TXTs de íntegra e associa cada publicação do e-mail.
 
-    O e-mail passa a apontar para o HTML de íntegra.
-    Dentro do HTML ficam os links oficiais do DOU e o TXT.
+    Regra de associação:
+    1. ocorrência incremental de processo: chave_email_ocorrencia;
+    2. publicação tradicional: título normalizado como fallback.
+
+    A chave da ocorrência evita associar a íntegra errada quando existem
+    publicações com títulos iguais ou genéricos.
     """
 
     if gerar_integras_do_json is None:
-        print("[EMAIL DOU] Serviço de íntegra HTML indisponível. Mantendo links atuais.")
+        print(
+            "[EMAIL DOU] Serviço de íntegra HTML indisponível. "
+            "Mantendo links atuais."
+        )
         return publicacoes
 
     try:
@@ -750,41 +1036,156 @@ def anexar_links_integras_publicacoes(
             abrir_primeiro_html=False,
         )
     except Exception as erro:
-        print(f"[EMAIL DOU] Erro ao gerar íntegra HTML/TXT: {erro}")
+        print(
+            "[EMAIL DOU] Erro ao gerar íntegra HTML/TXT: "
+            f"{erro}"
+        )
         return publicacoes
 
-    indice_por_titulo = {}
+    indice_por_chave_email: dict[str, dict] = {}
+    indice_por_titulo: dict[str, list[dict]] = {}
 
     for item in arquivos_integras:
-        titulo = chave_integra_email(item.get("titulo"))
         caminho_html = str(item.get("html") or "").strip()
 
-        if titulo and caminho_html:
-            indice_por_titulo[titulo] = {
-                "href": caminho_integra_para_href_email(caminho_html),
-                "caminho_html": caminho_html,
-                "caminho_txt": str(item.get("txt") or "").strip(),
-            }
+        if not caminho_html:
+            continue
+
+        dados_integra = {
+            "href": caminho_integra_para_href_email(caminho_html),
+            "caminho_html": caminho_html,
+            "caminho_txt": str(item.get("txt") or "").strip(),
+            "origem_integra": str(
+                item.get("origem_integra") or ""
+            ).strip(),
+            "data_publicacao": str(
+                item.get("data_publicacao") or ""
+            ).strip(),
+            "processos": list(item.get("processos") or []),
+        }
+
+        for chave_email in (
+            item.get("chaves_email_ocorrencias") or []
+        ):
+            chave_email = str(chave_email or "").strip()
+
+            if chave_email:
+                indice_por_chave_email[chave_email] = dados_integra
+
+        titulo = chave_integra_email(item.get("titulo"))
+
+        if titulo:
+            indice_por_titulo.setdefault(titulo, []).append(
+                dados_integra
+            )
 
     total_associados = 0
+    associados_por_chave = 0
+    associados_por_titulo = 0
+    sem_integra = 0
 
     for publicacao in publicacoes:
-        titulo = chave_integra_email(publicacao.get("titulo"))
-        dados_integra = indice_por_titulo.get(titulo)
+        dados_integra = None
+        criterio_associacao = ""
+
+        chave_email = str(
+            publicacao.get("chave_email_ocorrencia") or ""
+        ).strip()
+
+        if chave_email:
+            dados_integra = indice_por_chave_email.get(
+                chave_email
+            )
+
+            if dados_integra:
+                criterio_associacao = "CHAVE_OCORRENCIA"
+
+        if dados_integra is None:
+            titulo = chave_integra_email(
+                publicacao.get("titulo")
+            )
+            candidatos_titulo = indice_por_titulo.get(
+                titulo,
+                [],
+            )
+
+            if len(candidatos_titulo) == 1:
+                dados_integra = candidatos_titulo[0]
+                criterio_associacao = "TITULO_UNICO"
+
+            elif len(candidatos_titulo) > 1:
+                # Em caso de título repetido, evita escolher uma íntegra
+                # arbitrariamente. Publicações incrementais devem usar chave.
+                processo_publicacao = normalizar_texto_busca(
+                    (
+                        publicacao.get("processos_detectados")
+                        or [""]
+                    )[0]
+                )
+
+                candidatos_processo = [
+                    item
+                    for item in candidatos_titulo
+                    if processo_publicacao
+                    and processo_publicacao
+                    in {
+                        normalizar_texto_busca(processo)
+                        for processo in (
+                            item.get("processos") or []
+                        )
+                    }
+                ]
+
+                if len(candidatos_processo) == 1:
+                    dados_integra = candidatos_processo[0]
+                    criterio_associacao = "TITULO_E_PROCESSO"
 
         if not dados_integra:
+            sem_integra += 1
             continue
 
         publicacao["url_integra_html"] = dados_integra["href"]
-        publicacao["caminho_integra_html"] = dados_integra["caminho_html"]
-        publicacao["caminho_integra_txt"] = dados_integra["caminho_txt"]
+        publicacao["caminho_integra_html"] = (
+            dados_integra["caminho_html"]
+        )
+        publicacao["caminho_integra_txt"] = (
+            dados_integra["caminho_txt"]
+        )
+        publicacao["criterio_associacao_integra"] = (
+            criterio_associacao
+        )
+        publicacao["origem_integra"] = (
+            dados_integra.get("origem_integra")
+        )
+
         total_associados += 1
 
-    print("[EMAIL DOU] Íntegras HTML/TXT geradas para o e-mail.")
-    print(f"[EMAIL DOU] Total de publicações com link de íntegra associado: {total_associados}")
+        if criterio_associacao == "CHAVE_OCORRENCIA":
+            associados_por_chave += 1
+        else:
+            associados_por_titulo += 1
+
+    print(
+        "[EMAIL DOU] Íntegras HTML/TXT geradas para o e-mail."
+    )
+    print(
+        "[EMAIL DOU] Associadas por chave da ocorrência: "
+        f"{associados_por_chave}"
+    )
+    print(
+        "[EMAIL DOU] Associadas por título/fallback: "
+        f"{associados_por_titulo}"
+    )
+    print(
+        "[EMAIL DOU] Sem íntegra própria; mantendo link oficial: "
+        f"{sem_integra}"
+    )
+    print(
+        "[EMAIL DOU] Total de publicações com link de íntegra: "
+        f"{total_associados}"
+    )
 
     return publicacoes
-
 
 
 def _dou_env_bool(nome: str, padrao: bool = False) -> bool:
@@ -1019,6 +1420,18 @@ def enriquecer_publicacoes_com_links_modernos(
     for indice, publicacao in enumerate(publicacoes):
         titulo = str(publicacao.get("titulo") or "").strip()
         url_atual = selecionar_url_publicacao(publicacao)
+        fonte_monitoramento = normalizar_texto_busca(
+            publicacao.get("fonte_monitoramento")
+        )
+
+        if "anvisa" in fonte_monitoramento:
+            publicacao["status_resolucao_link"] = "LINK_EXTERNO_ANVISA"
+            publicacao["url"] = (
+                str(publicacao.get("url_item") or "").strip()
+                or str(publicacao.get("url_pdf") or "").strip()
+                or url_atual
+            )
+            continue
 
         if url_eh_link_moderno_dou(url_atual):
             publicacao["url"] = url_atual
@@ -1359,8 +1772,29 @@ def montar_linhas_tabela(
                 '</span>'
             )
 
+        fonte_monitoramento = html.escape(
+            str(publicacao.get("fonte_monitoramento") or "").strip()
+        )
+        data_publicacao = html.escape(
+            str(publicacao.get("data_publicacao") or "").strip()
+        )
+
         if orgao:
             detalhes_publicacao += f'<br><span style="color:#555;">{orgao}</span>'
+
+        if fonte_monitoramento:
+            detalhes_publicacao += (
+                '<br><span style="color:#666; font-size:12px;">'
+                f'Fonte: {fonte_monitoramento}'
+                '</span>'
+            )
+
+        if data_publicacao:
+            detalhes_publicacao += (
+                '<br><span style="color:#777; font-size:12px;">'
+                f'Data: {data_publicacao}'
+                '</span>'
+            )
 
         if localizacao:
             detalhes_publicacao += f'<br><span style="color:#777;">{html.escape(localizacao)}</span>'
@@ -1550,14 +1984,28 @@ def enviar_email_dou_diario(
     modelo_json = carregar_json_seguro(caminho_modelo_json)
     resumo = extrair_resumo_modelo(modelo_json)
 
-    publicacoes = carregar_publicacoes_relevantes(data_execucao)
+    publicacoes_tradicionais = carregar_publicacoes_relevantes(
+        data_execucao
+    )
+    (
+        publicacoes_processos_pendentes,
+        chaves_ocorrencias_processos_incluidas,
+    ) = carregar_publicacoes_processos_pendentes()
+
+    publicacoes = combinar_publicacoes_com_processos_pendentes(
+        publicacoes_tradicionais=publicacoes_tradicionais,
+        publicacoes_processos=publicacoes_processos_pendentes,
+    )
 
     if not publicacoes and not ENVIAR_EMAIL_SEM_PUBLICACOES:
         return {
             "status": "IGNORADO_SEM_PUBLICACOES",
             "data": data_execucao.isoformat(),
             "finalidade": FINALIDADE,
-            "mensagem": "Nenhuma publicação relevante encontrada. E-mail não enviado.",
+            "mensagem": "Nenhuma publicação relevante ou ocorrência pendente de processo encontrada. E-mail não enviado.",
+            "quantidade_publicacoes_tradicionais": len(publicacoes_tradicionais),
+            "quantidade_ocorrencias_processos": len(publicacoes_processos_pendentes),
+            "chaves_ocorrencias_processos_incluidas": [],
             "caminho_modelo_json": str(caminho_modelo_json),
             "caminho_relatorio_txt": str(caminho_relatorio_txt),
         }
@@ -1604,6 +2052,15 @@ def enviar_email_dou_diario(
         "data": data_execucao.isoformat(),
         "finalidade": FINALIDADE,
         "quantidade_publicacoes": len(publicacoes),
+        "quantidade_publicacoes_tradicionais": len(
+            publicacoes_tradicionais
+        ),
+        "quantidade_ocorrencias_processos": len(
+            publicacoes_processos_pendentes
+        ),
+        "chaves_ocorrencias_processos_incluidas": (
+            chaves_ocorrencias_processos_incluidas
+        ),
         "links_modernos_resolvidos": sum(
             1 for publicacao in publicacoes
             if url_eh_link_moderno_dou(publicacao.get("url_publicacao_web") or publicacao.get("url"))

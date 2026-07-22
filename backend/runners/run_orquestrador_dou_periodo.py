@@ -20,6 +20,29 @@ from backend.orquestradores.orquestrador_dou import (
 from backend.services.email_dou_diario_service import (
     enviar_email_dou_diario,
 )
+from backend.runners.run_sincronizacao_processos_incremental_2026 import (
+    executar as executar_sincronizacao_processos_incremental,
+)
+from backend.runners.run_pesquisa_processos_incremental_dou_2026 import (
+    caminho_resultado_json as caminho_resultado_processos_dou_json,
+    executar as executar_pesquisa_processos_incremental_dou,
+)
+from backend.runners.run_descoberta_documentos_anvisa_incremental_2026 import (
+    executar as executar_descoberta_documentos_anvisa_incremental,
+)
+from backend.runners.run_processamento_documentos_anvisa_incremental_2026 import (
+    caminho_resultado_json as caminho_resultado_processos_anvisa_json,
+    executar as executar_processamento_documentos_anvisa_incremental,
+)
+from backend.runners.run_revisao_historica_processos_pendentes_2026 import (
+    CAMINHO_JSON as CAMINHO_RESULTADO_HISTORICO_PROCESSOS,
+)
+from backend.services.controle_email_processos_service import (
+    marcar_ocorrencias_comunicadas,
+    obter_ocorrencias_pendentes,
+    registrar_falha_envio,
+    registrar_ocorrencias_pendentes,
+)
 
 
 # ============================================================
@@ -84,6 +107,16 @@ EMAIL_DOU_DIARIO_MODO_SIMULACAO = False
 # False = se o pipeline rodar com sucesso, mas o e-mail falhar,
 # registra o erro do e-mail no status tÃ©cnico e continua o perÃ­odo.
 FALHAR_EXECUCAO_SE_EMAIL_FALHAR = False
+
+# True = ativa o novo fluxo incremental de processos:
+# - sincroniza a planilha e revisa o histórico apenas de processos novos;
+# - pesquisa processos ativos somente na base DOU da data gerada;
+# - descobre e processa somente documentos novos da Anvisa.
+EXECUTAR_MONITORAMENTO_INCREMENTAL_PROCESSOS = True
+
+# False = falha no monitoramento incremental não invalida o DOU diário.
+# O erro fica registrado no resumo/status técnico para nova tentativa.
+FALHAR_EXECUCAO_SE_MONITORAMENTO_PROCESSOS_FALHAR = False
 
 
 # ============================================================
@@ -650,6 +683,19 @@ def imprimir_resumo_execucao(resultados_execucao: list[dict]) -> None:
                 f"suspeitos={valor_resumo(resumo, 'possiveis_falsos_positivos', suspeitos)}",
             ])
 
+        monitoramento_processos = item.get(
+            "monitoramento_processos_dou_incremental"
+        )
+
+        if (
+            isinstance(monitoramento_processos, dict)
+            and monitoramento_processos.get("status")
+        ):
+            partes.append(
+                "processos_dou_incremental="
+                f"{monitoramento_processos.get('status')}"
+            )
+
         email_dou = item.get("email_dou_diario")
 
         if isinstance(email_dou, dict) and email_dou.get("status"):
@@ -683,6 +729,152 @@ def imprimir_resumo_periodo(resumo_periodo: dict) -> None:
 
 
 # ============================================================
+# CONTROLE DE OCORRÊNCIAS — PROCESSOS / E-MAIL
+# ============================================================
+
+def extrair_resultados_monitoramento(caminho: Path) -> list[dict]:
+    if not caminho.exists():
+        return []
+
+    payload = carregar_json_seguro(caminho)
+    resultados = payload.get("resultados", [])
+
+    if not isinstance(resultados, list):
+        return []
+
+    return [
+        item
+        for item in resultados
+        if isinstance(item, dict)
+    ]
+
+
+def registrar_resultados_monitoramento_seguro(
+    *,
+    caminho: Path,
+    etapa: str,
+) -> dict:
+    """
+    Registra resultados no controle de e-mail sem invalidar o DOU diário.
+
+    A ocorrência permanece pendente até confirmação de envio real.
+    """
+
+    try:
+        resultados = extrair_resultados_monitoramento(caminho)
+
+        if not resultados:
+            return {
+                "status": "SEM_RESULTADOS_PARA_REGISTRAR",
+                "etapa": etapa,
+                "arquivo_resultado": str(caminho),
+                "resultados_lidos": 0,
+            }
+
+        resultados_enriquecidos = []
+
+        for item in resultados:
+            ocorrencia = dict(item)
+            ocorrencia["origem_fluxo"] = etapa
+            resultados_enriquecidos.append(ocorrencia)
+
+        controle = registrar_ocorrencias_pendentes(
+            resultados_enriquecidos
+        )
+
+        return {
+            "status": controle.get("status"),
+            "etapa": etapa,
+            "arquivo_resultado": str(caminho),
+            "resultados_lidos": len(resultados_enriquecidos),
+            "novas": len(controle.get("novas", []) or []),
+            "ja_pendentes": len(
+                controle.get("ja_pendentes", []) or []
+            ),
+            "ja_comunicadas": len(
+                controle.get("ja_comunicadas", []) or []
+            ),
+            "total_pendentes": controle.get("total_pendentes"),
+            "caminho_controle": controle.get("caminho_controle"),
+        }
+
+    except Exception as erro:
+        traceback_texto = traceback.format_exc()
+        nome_etapa = "".join(
+            caractere
+            if caractere.isalnum()
+            else "_"
+            for caractere in str(etapa).lower()
+        )
+        erro_path = (
+            LOGS_EXECUCAO_DIR
+            / f"erro_registro_email_processos_{nome_etapa}.txt"
+        )
+        erro_path.write_text(traceback_texto, encoding="utf-8")
+
+        resultado_erro = {
+            "status": "ERRO_REGISTRO_CONTROLE_EMAIL",
+            "etapa": etapa,
+            "arquivo_resultado": str(caminho),
+            "erro": str(erro),
+            "traceback_path": str(erro_path),
+        }
+
+        if FALHAR_EXECUCAO_SE_MONITORAMENTO_PROCESSOS_FALHAR:
+            raise
+
+        return resultado_erro
+
+
+def registrar_historico_novos_processos_seguro(
+    resultado_sincronizacao: dict,
+) -> dict:
+    status = str(
+        resultado_sincronizacao.get("status") or ""
+    ).upper()
+    processos_revisados = (
+        resultado_sincronizacao.get(
+            "processos_historicos_pendentes",
+            [],
+        )
+        or []
+    )
+
+    if status != "SUCESSO" or not processos_revisados:
+        return {
+            "status": "IGNORADO_SEM_NOVO_HISTORICO_CONCLUIDO",
+            "processos_revisados": len(processos_revisados),
+        }
+
+    return registrar_resultados_monitoramento_seguro(
+        caminho=CAMINHO_RESULTADO_HISTORICO_PROCESSOS,
+        etapa="HISTORICO_PROCESSO_NOVO",
+    )
+
+
+def obter_chaves_pendentes_email() -> list[str]:
+    chaves = []
+
+    for ocorrencia in obter_ocorrencias_pendentes():
+        chave = str(
+            ocorrencia.get("chave_email") or ""
+        ).strip()
+
+        if chave and chave not in chaves:
+            chaves.append(chave)
+
+    return chaves
+
+
+def status_email_confirma_envio_real(resultado_email: dict) -> bool:
+    status = str(
+        resultado_email.get("status") or ""
+    ).strip().upper()
+
+    return status == "ENVIADO"
+
+
+# ============================================================
 # ENVIO DE E-MAIL â€” DOU DIÃRIO
 # ============================================================
 
@@ -711,13 +903,11 @@ def tentar_enviar_email_dou_diario_item(
     resultado: dict,
 ) -> dict | None:
     """
-    Envia/simula o e-mail diÃ¡rio apenas para dou_diario executado com sucesso.
+    Envia o e-mail diário e confirma as ocorrências somente após status ENVIADO.
 
-    Regras:
-    - informativos nunca envia e-mail diÃ¡rio.
-    - dou_diario sÃ³ envia apÃ³s execuÃ§Ã£o com status SUCESSO.
-    - falha no e-mail Ã© registrada sem quebrar o perÃ­odo, salvo se
-      FALHAR_EXECUCAO_SE_EMAIL_FALHAR = True.
+    Falha de SMTP, Cloudflare ou montagem:
+    - não remove ocorrências pendentes;
+    - registra a tentativa para nova execução.
     """
 
     if finalidade != "dou_diario":
@@ -733,15 +923,24 @@ def tentar_enviar_email_dou_diario_item(
         return {
             "status": "IGNORADO_STATUS_NAO_SUCESSO",
             "status_execucao": resultado.get("status"),
-            "mensagem": "E-mail nÃ£o enviado porque a execuÃ§Ã£o nÃ£o retornou SUCESSO.",
+            "mensagem": (
+                "E-mail não enviado porque a execução "
+                "não retornou SUCESSO."
+            ),
         }
 
+    chaves_tentativa = obter_chaves_pendentes_email()
+
     print("=" * 80)
-    print("ENVIO DE E-MAIL â€” DOU DIÃRIO")
+    print("ENVIO DE E-MAIL — DOU DIÁRIO + PROCESSOS")
     print("=" * 80)
     print(f"Data: {data_execucao.isoformat()}")
     print("Finalidade: dou_diario")
-    print("AÃ§Ã£o: preparar simulaÃ§Ã£o/envio do e-mail diÃ¡rio")
+    print(
+        "Ocorrências de processos pendentes antes do envio: "
+        f"{len(chaves_tentativa)}"
+    )
+    print("Modo de e-mail: ENVIO REAL")
     print("=" * 80)
 
     try:
@@ -750,11 +949,57 @@ def tentar_enviar_email_dou_diario_item(
             modo_simulacao=EMAIL_DOU_DIARIO_MODO_SIMULACAO,
         )
 
+        chaves_incluidas = [
+            str(chave)
+            for chave in (
+                resultado_email.get(
+                    "chaves_ocorrencias_processos_incluidas",
+                    [],
+                )
+                or []
+            )
+            if str(chave).strip()
+        ]
+
+        controle_email = {
+            "status": "SEM_OCORRENCIAS_DE_PROCESSOS_NO_EMAIL",
+            "ocorrencias": 0,
+        }
+
+        if status_email_confirma_envio_real(resultado_email):
+            if chaves_incluidas:
+                controle_email = marcar_ocorrencias_comunicadas(
+                    chaves_incluidas,
+                    data_email=data_execucao.isoformat(),
+                    status_email="ENVIADO",
+                )
+        elif chaves_incluidas:
+            controle_email = registrar_falha_envio(
+                chaves_incluidas,
+                erro=(
+                    "O serviço de e-mail não confirmou envio real. "
+                    f"Status retornado: {resultado_email.get('status')}"
+                ),
+            )
+
+        resultado_email["controle_email_processos"] = controle_email
+
         print("=" * 80)
-        print("RESULTADO DO E-MAIL â€” DOU DIÃRIO")
+        print("RESULTADO DO E-MAIL — DOU DIÁRIO + PROCESSOS")
         print("=" * 80)
         print(f"Status e-mail: {resultado_email.get('status')}")
-        print(f"Quantidade publicaÃ§Ãµes: {resultado_email.get('quantidade_publicacoes')}")
+        print(
+            "Quantidade total de publicações: "
+            f"{resultado_email.get('quantidade_publicacoes')}"
+        )
+        print(
+            "Ocorrências de processos incluídas: "
+            f"{len(chaves_incluidas)}"
+        )
+        print(
+            "Ocorrências confirmadas como comunicadas: "
+            f"{controle_email.get('ocorrencias_movidas', 0)}"
+        )
         print("=" * 80)
 
         return resultado_email
@@ -766,8 +1011,24 @@ def tentar_enviar_email_dou_diario_item(
             LOGS_EXECUCAO_DIR
             / f"erro_email_dou_diario_{data_execucao.isoformat()}.txt"
         )
-
         erro_path.write_text(traceback_texto, encoding="utf-8")
+
+        controle_email = {
+            "status": "SEM_OCORRENCIAS_PENDENTES",
+            "ocorrencias_atualizadas": 0,
+        }
+
+        if chaves_tentativa:
+            try:
+                controle_email = registrar_falha_envio(
+                    chaves_tentativa,
+                    erro=str(erro),
+                )
+            except Exception as erro_controle:
+                controle_email = {
+                    "status": "ERRO_AO_REGISTRAR_FALHA_EMAIL",
+                    "erro": str(erro_controle),
+                }
 
         resultado_erro = {
             "status": "ERRO_EMAIL",
@@ -775,13 +1036,18 @@ def tentar_enviar_email_dou_diario_item(
             "finalidade": finalidade,
             "erro": str(erro),
             "traceback_path": str(erro_path),
+            "controle_email_processos": controle_email,
         }
 
         print("=" * 80)
-        print("ERRO NO ENVIO DO E-MAIL â€” DOU DIÃRIO")
+        print("ERRO NO ENVIO DO E-MAIL — DOU DIÁRIO")
         print("=" * 80)
         print(f"Data: {data_execucao.isoformat()}")
         print(f"Erro: {erro}")
+        print(
+            "As ocorrências de processos permanecem pendentes "
+            "para nova tentativa."
+        )
         print(f"Traceback: {erro_path}")
         print("=" * 80)
 
@@ -789,6 +1055,207 @@ def tentar_enviar_email_dou_diario_item(
             raise
 
         return resultado_erro
+
+
+# ============================================================
+# MONITORAMENTO INCREMENTAL DE PROCESSOS — EXECUÇÃO SEGURA
+# ============================================================
+
+async def executar_sincronizacao_processos_incremental_segura() -> dict:
+    """
+    Sincroniza a planilha com o controle e revisa o histórico somente dos
+    processos novos. Processos já ativos não têm o acervo anual reprocessado.
+    """
+
+    if not EXECUTAR_MONITORAMENTO_INCREMENTAL_PROCESSOS:
+        return {
+            "status": "DESABILITADO",
+            "mensagem": "Monitoramento incremental desabilitado no runner.",
+        }
+
+    print("=" * 80)
+    print("SINCRONIZAÇÃO INCREMENTAL DE PROCESSOS")
+    print("=" * 80)
+
+    try:
+        resultado = await asyncio.to_thread(
+            executar_sincronizacao_processos_incremental
+        )
+        resultado["controle_email_historico"] = (
+            registrar_historico_novos_processos_seguro(
+                resultado
+            )
+        )
+        return resultado
+
+    except Exception as erro:
+        traceback_texto = traceback.format_exc()
+        data_txt = datetime.date.today().isoformat()
+        erro_path = (
+            LOGS_EXECUCAO_DIR
+            / f"erro_sincronizacao_processos_incremental_{data_txt}.txt"
+        )
+        erro_path.write_text(traceback_texto, encoding="utf-8")
+
+        resultado_erro = {
+            "status": "ERRO",
+            "etapa": "SINCRONIZACAO_E_HISTORICO_NOVOS",
+            "erro": str(erro),
+            "traceback_path": str(erro_path),
+        }
+
+        if FALHAR_EXECUCAO_SE_MONITORAMENTO_PROCESSOS_FALHAR:
+            raise
+
+        return resultado_erro
+
+
+async def executar_pesquisa_processos_dou_incremental_segura(
+    data_execucao: datetime.date,
+    resultado_dou_diario: dict,
+) -> dict:
+    """
+    Pesquisa os processos ativos somente na base DOU da data recém-gerada.
+    Não abre sessão INLABS e não pesquisa outras datas.
+    """
+
+    if not EXECUTAR_MONITORAMENTO_INCREMENTAL_PROCESSOS:
+        return {
+            "status": "DESABILITADO",
+            "data": data_execucao.isoformat(),
+        }
+
+    if not execucao_pipeline_sucesso(resultado_dou_diario):
+        return {
+            "status": "IGNORADO_DOU_DIARIO_SEM_SUCESSO",
+            "data": data_execucao.isoformat(),
+            "status_dou_diario": resultado_dou_diario.get("status"),
+        }
+
+    print("=" * 80)
+    print("PESQUISA INCREMENTAL DE PROCESSOS — DOU DA DATA")
+    print("=" * 80)
+    print(f"Data: {data_execucao.isoformat()}")
+    print("Regra: somente a base DOU desta data.")
+    print("=" * 80)
+
+    try:
+        resultado = await asyncio.to_thread(
+            executar_pesquisa_processos_incremental_dou,
+            data_execucao,
+        )
+        resultado["controle_email_processos"] = (
+            registrar_resultados_monitoramento_seguro(
+                caminho=caminho_resultado_processos_dou_json(
+                    data_execucao
+                ),
+                etapa="DOU_INCREMENTAL_DIARIO",
+            )
+        )
+        return resultado
+
+    except Exception as erro:
+        traceback_texto = traceback.format_exc()
+        erro_path = (
+            LOGS_EXECUCAO_DIR
+            / f"erro_processos_incremental_dou_{data_execucao.isoformat()}.txt"
+        )
+        erro_path.write_text(traceback_texto, encoding="utf-8")
+
+        resultado_erro = {
+            "status": "ERRO",
+            "etapa": "PESQUISA_INCREMENTAL_DOU",
+            "data": data_execucao.isoformat(),
+            "erro": str(erro),
+            "traceback_path": str(erro_path),
+        }
+
+        if FALHAR_EXECUCAO_SE_MONITORAMENTO_PROCESSOS_FALHAR:
+            raise
+
+        return resultado_erro
+
+
+async def executar_anvisa_incremental_segura() -> dict:
+    """
+    Executa uma vez por chamada do runner oficial:
+    - descoberta dos documentos atuais de Atas/Pautas;
+    - processamento apenas dos documentos NOVO_PENDENTE.
+    """
+
+    if not EXECUTAR_MONITORAMENTO_INCREMENTAL_PROCESSOS:
+        return {
+            "status": "DESABILITADO",
+            "mensagem": "Monitoramento incremental desabilitado no runner.",
+        }
+
+    print("=" * 80)
+    print("MONITORAMENTO INCREMENTAL ANVISA/DICOL")
+    print("=" * 80)
+
+    resultado: dict = {
+        "status": "NAO_EXECUTADO",
+        "descoberta": None,
+        "processamento": None,
+    }
+
+    try:
+        descoberta = await asyncio.to_thread(
+            executar_descoberta_documentos_anvisa_incremental
+        )
+        resultado["descoberta"] = descoberta
+
+        processamento = await asyncio.to_thread(
+            executar_processamento_documentos_anvisa_incremental
+        )
+        resultado["processamento"] = processamento
+        resultado["controle_email_processos"] = (
+            registrar_resultados_monitoramento_seguro(
+                caminho=caminho_resultado_processos_anvisa_json(
+                    datetime.date.today().isoformat()
+                ),
+                etapa="ANVISA_INCREMENTAL",
+            )
+        )
+
+        status_descoberta = str(descoberta.get("status") or "").upper()
+        status_processamento = str(processamento.get("status") or "").upper()
+
+        status_aceitos = {
+            "SUCESSO",
+            "SEM_DOCUMENTOS_NOVOS_PENDENTES",
+        }
+
+        if (
+            status_descoberta == "SUCESSO"
+            and status_processamento in status_aceitos
+        ):
+            resultado["status"] = "SUCESSO"
+        else:
+            resultado["status"] = "CONCLUIDO_COM_PENDENCIAS"
+
+        return resultado
+
+    except Exception as erro:
+        traceback_texto = traceback.format_exc()
+        data_txt = datetime.date.today().isoformat()
+        erro_path = (
+            LOGS_EXECUCAO_DIR
+            / f"erro_anvisa_incremental_{data_txt}.txt"
+        )
+        erro_path.write_text(traceback_texto, encoding="utf-8")
+
+        resultado.update({
+            "status": "ERRO",
+            "etapa": "ANVISA_INCREMENTAL",
+            "erro": str(erro),
+            "traceback_path": str(erro_path),
+        })
+
+        if FALHAR_EXECUCAO_SE_MONITORAMENTO_PROCESSOS_FALHAR:
+            raise
+
+        return resultado
 
 
 # ============================================================
@@ -958,6 +1425,23 @@ async def executar_itens_planejados(planejamento: dict) -> list[dict]:
                 continuar_se_finalidade_erro=True,
             )
 
+            resultado_processos_dou_incremental = None
+
+            if "dou_diario" in finalidades_grupo:
+                resultado_dou_grupo = (
+                    extrair_resultado_finalidade_multifinalidade(
+                        resultado_multifinalidade=resultado_multifinalidade,
+                        finalidade="dou_diario",
+                    )
+                )
+
+                resultado_processos_dou_incremental = (
+                    await executar_pesquisa_processos_dou_incremental_segura(
+                        data_execucao=data_execucao,
+                        resultado_dou_diario=resultado_dou_grupo,
+                    )
+                )
+
             for item in itens_grupo:
                 finalidade = item.get("finalidade")
                 status_original = item.get("status")
@@ -980,6 +1464,11 @@ async def executar_itens_planejados(planejamento: dict) -> list[dict]:
                     "status_execucao": resultado_finalidade.get("status"),
                     "resultado": resultado_finalidade,
                     "email_dou_diario": resultado_email_dou_diario,
+                    "monitoramento_processos_dou_incremental": (
+                        resultado_processos_dou_incremental
+                        if finalidade == "dou_diario"
+                        else None
+                    ),
                     "execucao_multifinalidade": {
                         "status": resultado_multifinalidade.get("status"),
                         "status_path": resultado_multifinalidade.get("status_path"),
@@ -1005,6 +1494,7 @@ async def executar_itens_planejados(planejamento: dict) -> list[dict]:
                     "erro": str(erro),
                     "traceback_path": str(erro_path),
                     "email_dou_diario": None,
+                    "monitoramento_processos_dou_incremental": None,
                 })
 
             print("=" * 80)
@@ -1176,6 +1666,13 @@ def montar_resumo_periodo(
                 if resultado_execucao
                 else None
             ),
+            "monitoramento_processos_dou_incremental": (
+                resultado_execucao.get(
+                    "monitoramento_processos_dou_incremental"
+                )
+                if resultado_execucao
+                else None
+            ),
         })
 
     resumo_periodo = {
@@ -1307,9 +1804,36 @@ async def main() -> None:
 
     resultados_execucao = []
 
+    resultado_sincronizacao_processos = {
+        "status": (
+            "IGNORADO_MODO_SIMULACAO"
+            if MODO_SIMULACAO
+            else "NAO_EXECUTADO"
+        )
+    }
+    resultado_anvisa_incremental = {
+        "status": (
+            "IGNORADO_MODO_SIMULACAO"
+            if MODO_SIMULACAO
+            else "NAO_EXECUTADO"
+        )
+    }
+
     if MODO_SIMULACAO:
-        print("SIMULAÃ‡ÃƒO FINALIZADA. Nenhum pipeline foi executado.")
+        print("SIMULAÇÃO FINALIZADA. Nenhum pipeline foi executado.")
     else:
+        # Executado uma única vez por chamada do runner.
+        # Se houver processo novo, somente ele passa pela revisão histórica.
+        resultado_sincronizacao_processos = (
+            await executar_sincronizacao_processos_incremental_segura()
+        )
+
+        # A Anvisa é executada antes dos itens diários para que qualquer
+        # ocorrência nova já esteja no mesmo e-mail do DOU.
+        resultado_anvisa_incremental = (
+            await executar_anvisa_incremental_segura()
+        )
+
         resultados_execucao = await executar_itens_planejados(
             planejamento=planejamento,
         )
@@ -1319,6 +1843,13 @@ async def main() -> None:
         planejamento=planejamento,
         resultados_execucao=resultados_execucao,
     )
+
+    resumo_periodo["monitoramento_incremental_processos"] = {
+        "sincronizacao_e_historico_novos": (
+            resultado_sincronizacao_processos
+        ),
+        "anvisa_incremental": resultado_anvisa_incremental,
+    }
 
     imprimir_resumo_periodo(resumo_periodo)
 
@@ -1336,8 +1867,16 @@ async def main() -> None:
         resumo_periodo=resumo_periodo,
     )
 
-    print(f"Resumo operacional do perÃ­odo salvo em: {caminho_resumo_periodo}")
-    print(f"Status tÃ©cnico do perÃ­odo salvo em: {caminho_status}")
+    print(f"Resumo operacional do período salvo em: {caminho_resumo_periodo}")
+    print(f"Status técnico do período salvo em: {caminho_status}")
+    print(
+        "Status sincronização/histórico de processos: "
+        f"{resultado_sincronizacao_processos.get('status')}"
+    )
+    print(
+        "Status Anvisa incremental: "
+        f"{resultado_anvisa_incremental.get('status')}"
+    )
 
 
 if __name__ == "__main__":

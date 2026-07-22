@@ -18,6 +18,13 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+try:
+    from backend.services.controle_email_processos_service import (
+        obter_ocorrencias_pendentes,
+    )
+except Exception:
+    obter_ocorrencias_pendentes = None
+
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = BASE_DIR / "backend" / "data" / "dou"
@@ -397,6 +404,470 @@ def consolidar_publicacoes(registros: List[Dict[str, Any]], data_iso: str) -> Li
 
     saida.sort(key=lambda g: (g.get("paginas") or ["999999"])[0])
     return saida
+
+
+# -----------------------------------------------------------------------------
+# Ocorrências exatas de processos monitorados
+# -----------------------------------------------------------------------------
+
+
+def normalizar_processo_digitos(valor: Any) -> str:
+    digitos = re.sub(r"\D", "", str(valor or ""))
+
+    if len(digitos) != 17:
+        return ""
+
+    return digitos
+
+
+def processo_formatado(valor: Any) -> str:
+    digitos = normalizar_processo_digitos(valor)
+
+    if not digitos:
+        return str(valor or "").strip()
+
+    return (
+        f"{digitos[0:5]}.{digitos[5:11]}/"
+        f"{digitos[11:15]}-{digitos[15:17]}"
+    )
+
+
+def fonte_eh_dou(ocorrencia: Dict[str, Any]) -> bool:
+    fonte = normalizar(
+        ocorrencia.get("fonte")
+        or ocorrencia.get("origem")
+        or ocorrencia.get("origem_fluxo")
+        or ""
+    )
+
+    if "anvisa" in fonte:
+        return False
+
+    return "dou" in fonte or "inlabs" in fonte
+
+
+def carregar_base_dou(data_iso: str) -> List[Dict[str, Any]]:
+    caminho = DATA_DIR / "base" / f"base_publicacoes_{data_iso}.json"
+
+    if not caminho.exists():
+        return []
+
+    try:
+        payload = json.loads(caminho.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    return obter_registros(payload)
+
+
+def extrair_data_ocorrencia(ocorrencia: Dict[str, Any]) -> str:
+    valor = primeiro_valor(
+        ocorrencia,
+        ("data_publicacao", "data"),
+    )
+
+    if not valor:
+        return ""
+
+    try:
+        return data_para_iso(valor)
+    except Exception:
+        return ""
+
+
+def extrair_processo_ocorrencia(ocorrencia: Dict[str, Any]) -> str:
+    valor = primeiro_valor(
+        ocorrencia,
+        ("processo", "valor_encontrado"),
+    )
+
+    return processo_formatado(valor)
+
+
+def urls_normalizadas(obj: Any) -> set[str]:
+    return {
+        normalizar(url).rstrip("/")
+        for url in coletar_urls(obj)
+        if str(url or "").strip()
+    }
+
+
+def registro_contem_processo_exato(
+    registro: Dict[str, Any],
+    processo: str,
+) -> bool:
+    processo = processo_formatado(processo)
+
+    if not normalizar_processo_digitos(processo):
+        return False
+
+    texto = extrair_texto_publicacao(registro)
+
+    if not texto:
+        return False
+
+    return bool(localizar_ocorrencias_flexiveis(texto, [processo]))
+
+
+def pontuar_registro_para_ocorrencia(
+    registro: Dict[str, Any],
+    ocorrencia: Dict[str, Any],
+    processo: str,
+) -> int:
+    """
+    Localiza o registro integral usando metadados da ocorrência e exige
+    a presença exata do processo no texto da base.
+
+    A exigência do processo evita associar a íntegra errada quando existem
+    títulos genéricos ou repetidos no DOU.
+    """
+    if not registro_contem_processo_exato(registro, processo):
+        return -1
+
+    pontos = 100
+
+    titulo_ocorrencia = normalizar(
+        primeiro_valor(
+            ocorrencia,
+            ("titulo", "titulo_publicacao", "ementa"),
+        )
+    )
+    titulo_registro = normalizar(extrair_titulo(registro))
+
+    if titulo_ocorrencia and titulo_ocorrencia == titulo_registro:
+        pontos += 40
+    elif (
+        titulo_ocorrencia
+        and titulo_registro
+        and (
+            titulo_ocorrencia in titulo_registro
+            or titulo_registro in titulo_ocorrencia
+        )
+    ):
+        pontos += 20
+
+    orgao_ocorrencia = normalizar(
+        primeiro_valor(
+            ocorrencia,
+            ("orgao", "órgão", "orgao_publicacao"),
+        )
+    )
+    orgao_registro = normalizar(extrair_orgao(registro))
+
+    if orgao_ocorrencia and orgao_ocorrencia == orgao_registro:
+        pontos += 20
+
+    pagina_ocorrencia = primeiro_valor(
+        ocorrencia,
+        ("pagina", "página", "pagina_publicacao"),
+    )
+    pagina_registro = primeiro_valor(
+        registro,
+        ("pagina", "página", "pagina_publicacao", "page"),
+    )
+
+    if (
+        pagina_ocorrencia
+        and pagina_registro
+        and str(pagina_ocorrencia).strip() == str(pagina_registro).strip()
+    ):
+        pontos += 20
+
+    arquivo_ocorrencia = normalizar(
+        primeiro_valor(
+            ocorrencia,
+            ("arquivo", "arquivo_xml"),
+        )
+    )
+    arquivo_registro = normalizar(
+        primeiro_valor(
+            registro,
+            ("arquivo", "arquivo_xml"),
+        )
+    )
+
+    if arquivo_ocorrencia and arquivo_ocorrencia == arquivo_registro:
+        pontos += 60
+
+    urls_ocorrencia = urls_normalizadas(ocorrencia)
+    urls_registro = urls_normalizadas(registro)
+
+    if urls_ocorrencia and urls_registro.intersection(urls_ocorrencia):
+        pontos += 60
+
+    return pontos
+
+
+def localizar_registros_integra_ocorrencia(
+    ocorrencia: Dict[str, Any],
+    cache_bases: Dict[str, List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    data_iso = extrair_data_ocorrencia(ocorrencia)
+    processo = extrair_processo_ocorrencia(ocorrencia)
+
+    if not data_iso or not normalizar_processo_digitos(processo):
+        return []
+
+    if data_iso not in cache_bases:
+        cache_bases[data_iso] = carregar_base_dou(data_iso)
+
+    candidatos: List[Tuple[int, Dict[str, Any]]] = []
+
+    for registro in cache_bases[data_iso]:
+        pontos = pontuar_registro_para_ocorrencia(
+            registro=registro,
+            ocorrencia=ocorrencia,
+            processo=processo,
+        )
+
+        if pontos >= 0:
+            candidatos.append((pontos, registro))
+
+    if not candidatos:
+        return []
+
+    candidatos.sort(key=lambda item: item[0], reverse=True)
+    melhor_pontuacao = candidatos[0][0]
+
+    # Mantém todas as partes/páginas da publicação com a melhor identificação.
+    melhor_registro = candidatos[0][1]
+    titulo_referencia = normalizar(extrair_titulo(melhor_registro))
+    orgao_referencia = normalizar(extrair_orgao(melhor_registro))
+
+    selecionados = [
+        registro
+        for pontos, registro in candidatos
+        if (
+            pontos >= melhor_pontuacao - 20
+            and normalizar(extrair_titulo(registro)) == titulo_referencia
+            and normalizar(extrair_orgao(registro)) == orgao_referencia
+        )
+    ]
+
+    return selecionados or [melhor_registro]
+
+
+def consolidar_ocorrencias_processos_pendentes() -> List[Dict[str, Any]]:
+    """
+    Converte ocorrências pendentes do controle de e-mail em publicações
+    integrais, recuperando o texto completo na base diária do DOU.
+
+    Ocorrências sem base integral identificável não geram HTML falso:
+    permanecem com o link oficial de fallback no e-mail.
+    """
+    if obter_ocorrencias_pendentes is None:
+        return []
+
+    try:
+        ocorrencias = obter_ocorrencias_pendentes()
+    except Exception:
+        return []
+
+    cache_bases: Dict[str, List[Dict[str, Any]]] = {}
+    grupos: Dict[str, Dict[str, Any]] = {}
+
+    for ocorrencia in ocorrencias:
+        if not isinstance(ocorrencia, dict):
+            continue
+
+        if not fonte_eh_dou(ocorrencia):
+            continue
+
+        processo = extrair_processo_ocorrencia(ocorrencia)
+        data_iso = extrair_data_ocorrencia(ocorrencia)
+
+        if not processo or not data_iso:
+            continue
+
+        registros = localizar_registros_integra_ocorrencia(
+            ocorrencia=ocorrencia,
+            cache_bases=cache_bases,
+        )
+
+        if not registros:
+            continue
+
+        registro_referencia = registros[0]
+        titulo = extrair_titulo(registro_referencia)
+        orgao = extrair_orgao(registro_referencia)
+
+        chave = "|".join(
+            [
+                data_iso,
+                slugify(titulo, 180),
+                slugify(orgao, 80),
+            ]
+        )
+
+        if chave not in grupos:
+            grupos[chave] = {
+                "titulo": titulo,
+                "orgao": orgao,
+                "data_iso": data_iso,
+                "data_br": data_para_br(data_iso),
+                "edicao": "",
+                "secao": "",
+                "paginas": [],
+                "urls": [],
+                "termos": [],
+                "partes": [],
+                "origem_integra": "PROCESSO_MONITORADO_EXATO",
+                "chaves_email_ocorrencias": [],
+            }
+
+        grupo = grupos[chave]
+
+        if processo not in grupo["termos"]:
+            grupo["termos"].append(processo)
+
+        chave_email = str(
+            ocorrencia.get("chave_email") or ""
+        ).strip()
+
+        if (
+            chave_email
+            and chave_email not in grupo["chaves_email_ocorrencias"]
+        ):
+            grupo["chaves_email_ocorrencias"].append(chave_email)
+
+        for registro in registros:
+            pagina = primeiro_valor(
+                registro,
+                ("pagina", "pagina_publicacao", "page"),
+            )
+            edicao = primeiro_valor(
+                registro,
+                ("edicao", "edição", "numero_edicao", "edicao_dou"),
+            )
+            secao = primeiro_valor(
+                registro,
+                ("secao", "seção", "jornal", "secao_dou"),
+            )
+            texto_integral = extrair_texto_publicacao(registro)
+
+            if edicao and not grupo.get("edicao"):
+                grupo["edicao"] = edicao
+
+            if secao and not grupo.get("secao"):
+                grupo["secao"] = secao
+
+            if pagina and str(pagina) not in grupo["paginas"]:
+                grupo["paginas"].append(str(pagina))
+
+            for url in coletar_urls(registro):
+                if url not in grupo["urls"]:
+                    grupo["urls"].append(url)
+
+            texto_limpo = limpar_inicio_texto(
+                texto_integral,
+                titulo,
+            )
+
+            if texto_limpo:
+                grupo["partes"].append(
+                    {
+                        "pagina": pagina,
+                        "texto": texto_limpo,
+                    }
+                )
+
+        # Preserva também o link oficial capturado pela pesquisa incremental.
+        for url in coletar_urls(ocorrencia):
+            if url not in grupo["urls"]:
+                grupo["urls"].append(url)
+
+    saida: List[Dict[str, Any]] = []
+
+    for grupo in grupos.values():
+        grupo["partes"].sort(
+            key=lambda parte: (
+                int(str(parte.get("pagina") or "999999"))
+                if str(parte.get("pagina") or "").isdigit()
+                else 999999
+            )
+        )
+
+        textos: List[str] = []
+        vistos: set[str] = set()
+
+        for parte in grupo["partes"]:
+            texto_parte = str(parte.get("texto") or "").strip()
+
+            if not texto_parte:
+                continue
+
+            chave_texto = normalizar(texto_parte)[:3000]
+
+            if chave_texto in vistos:
+                continue
+
+            vistos.add(chave_texto)
+            textos.append(texto_parte)
+
+        grupo["texto_integral_consolidado"] = "\n\n".join(textos).strip()
+
+        if grupo["texto_integral_consolidado"]:
+            saida.append(grupo)
+
+    saida.sort(
+        key=lambda item: (
+            item.get("data_iso") or "",
+            (item.get("paginas") or ["999999"])[0],
+            item.get("titulo") or "",
+        )
+    )
+
+    return saida
+
+
+def combinar_publicacoes_integras(
+    tradicionais: List[Dict[str, Any]],
+    processos: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Une as duas origens e incorpora os processos exatos a uma íntegra
+    tradicional quando a publicação já estiver presente no match do dia.
+    """
+    combinadas = list(tradicionais)
+    indice: Dict[str, Dict[str, Any]] = {}
+
+    for publicacao in combinadas:
+        chave = "|".join(
+            [
+                str(publicacao.get("data_iso") or ""),
+                slugify(publicacao.get("titulo"), 180),
+                slugify(publicacao.get("orgao"), 80),
+            ]
+        )
+        indice[chave] = publicacao
+        publicacao.setdefault("origem_integra", "MATCH_TRADICIONAL")
+        publicacao.setdefault("chaves_email_ocorrencias", [])
+
+    for publicacao in processos:
+        chave = "|".join(
+            [
+                str(publicacao.get("data_iso") or ""),
+                slugify(publicacao.get("titulo"), 180),
+                slugify(publicacao.get("orgao"), 80),
+            ]
+        )
+
+        existente = indice.get(chave)
+
+        if existente is None:
+            combinadas.append(publicacao)
+            indice[chave] = publicacao
+            continue
+
+        for termo in publicacao.get("termos") or []:
+            if termo not in existente["termos"]:
+                existente["termos"].append(termo)
+
+        for chave_email in publicacao.get("chaves_email_ocorrencias") or []:
+            if chave_email not in existente["chaves_email_ocorrencias"]:
+                existente["chaves_email_ocorrencias"].append(chave_email)
+
+    return combinadas
 
 
 # -----------------------------------------------------------------------------
@@ -1037,15 +1508,34 @@ def gerar_integras_do_json(
     abrir_primeiro_html: bool = False,
 ) -> List[Dict[str, str]]:
     """
-    Gera HTML/TXT para todas as publicações com match de uma data/finalidade.
+    Gera HTML/TXT para:
+    - publicações tradicionais com match da data;
+    - ocorrências pendentes de processos exatos cuja íntegra foi localizada
+      na base diária do DOU.
 
-    Retorna lista com caminhos dos arquivos gerados.
+    Ocorrências sem texto integral identificável não recebem uma página
+    incompleta; o e-mail mantém o link oficial como fallback.
     """
 
     data_iso = data_para_iso(data_execucao)
     dados_json = carregar_json_match(data_iso, finalidade=finalidade)
     registros = obter_registros(dados_json)
-    publicacoes = consolidar_publicacoes(registros, data_iso=data_iso)
+
+    publicacoes_tradicionais = consolidar_publicacoes(
+        registros,
+        data_iso=data_iso,
+    )
+
+    publicacoes_processos = (
+        consolidar_ocorrencias_processos_pendentes()
+        if finalidade == "dou_diario"
+        else []
+    )
+
+    publicacoes = combinar_publicacoes_integras(
+        tradicionais=publicacoes_tradicionais,
+        processos=publicacoes_processos,
+    )
 
     pasta_saida = DATA_DIR / "integras" / finalidade / data_iso
     pasta_saida.mkdir(parents=True, exist_ok=True)
@@ -1055,24 +1545,51 @@ def gerar_integras_do_json(
 
     for publicacao in publicacoes:
         titulo = publicacao.get("titulo") or "publicacao"
+        origem_integra = str(
+            publicacao.get("origem_integra") or "MATCH_TRADICIONAL"
+        )
+
         slug_base = slugify(titulo)
+
+        if origem_integra == "PROCESSO_MONITORADO_EXATO":
+            processos_slug = "-".join(
+                slugify(termo, 40)
+                for termo in (publicacao.get("termos") or [])
+            )
+            if processos_slug:
+                slug_base = f"{slug_base}-processo-{processos_slug}"
+
         contador = slugs_usados.get(slug_base, 0) + 1
         slugs_usados[slug_base] = contador
 
-        slug_final = slug_base if contador == 1 else f"{slug_base}-{contador}"
+        slug_final = (
+            slug_base
+            if contador == 1
+            else f"{slug_base}-{contador}"
+        )
 
         caminho_html = pasta_saida / f"{slug_final}.html"
         caminho_txt = pasta_saida / f"{slug_final}.txt"
 
-        texto_integral = publicacao.get("texto_integral_consolidado") or ""
-        texto_html, contagem = renderizar_texto_com_destaques(texto_integral, publicacao.get("termos") or [])
+        texto_integral = (
+            publicacao.get("texto_integral_consolidado") or ""
+        )
+        texto_html, contagem = renderizar_texto_com_destaques(
+            texto_integral,
+            publicacao.get("termos") or [],
+        )
 
         termos_visiveis = [
-            termo for termo in (publicacao.get("termos") or [])
+            termo
+            for termo in (publicacao.get("termos") or [])
             if contagem.get(termo, 0) > 0
         ]
 
-        txt = montar_txt(publicacao, termos_visiveis, contagem)
+        txt = montar_txt(
+            publicacao,
+            termos_visiveis,
+            contagem,
+        )
         caminho_txt.write_text(txt, encoding="utf-8")
 
         html_doc = montar_html(
@@ -1090,11 +1607,23 @@ def gerar_integras_do_json(
             "txt": str(caminho_txt),
             "arquivo_html": caminho_html.name,
             "arquivo_txt": caminho_txt.name,
+            "origem_integra": origem_integra,
+            "data_publicacao": str(
+                publicacao.get("data_iso") or data_iso
+            ),
+            "processos": list(
+                publicacao.get("termos") or []
+            ),
+            "chaves_email_ocorrencias": list(
+                publicacao.get("chaves_email_ocorrencias") or []
+            ),
         })
 
     if abrir_primeiro_html and saida:
         import webbrowser
-        webbrowser.open(Path(saida[0]["html"]).resolve().as_uri())
+        webbrowser.open(
+            Path(saida[0]["html"]).resolve().as_uri()
+        )
 
     return saida
 
