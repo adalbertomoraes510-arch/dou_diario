@@ -263,6 +263,21 @@ def registrar_ocorrencias_pendentes(
             registro_atual = pendentes[chave]
 
             if isinstance(registro_atual, dict):
+                # Atualiza os dados funcionais da ocorrência,
+                # preservando a trilha de auditoria/retry já existente.
+                descoberta_em = registro_atual.get(
+                    "descoberta_em"
+                )
+                tentativas_envio = int(
+                    registro_atual.get("tentativas_envio") or 0
+                )
+                ultimo_erro_envio = registro_atual.get(
+                    "ultimo_erro_envio"
+                )
+                ultima_tentativa_envio_em = registro_atual.get(
+                    "ultima_tentativa_envio_em"
+                )
+
                 registro_atual.update(
                     preparar_ocorrencia(
                         ocorrencia,
@@ -270,6 +285,23 @@ def registrar_ocorrencias_pendentes(
                         instante=instante,
                     )
                 )
+
+                if descoberta_em:
+                    registro_atual["descoberta_em"] = (
+                        descoberta_em
+                    )
+
+                registro_atual["tentativas_envio"] = (
+                    tentativas_envio
+                )
+                registro_atual["ultimo_erro_envio"] = (
+                    ultimo_erro_envio
+                )
+
+                if ultima_tentativa_envio_em:
+                    registro_atual[
+                        "ultima_tentativa_envio_em"
+                    ] = ultima_tentativa_envio_em
 
             ja_pendentes.append(chave)
             continue
