@@ -328,16 +328,20 @@ def sincronizar_com_planilha() -> dict[str, Any]:
             registro["removido_em"] = None
             registro["reativado_em"] = instante
 
+            # Todo processo reativado deve validar o período
+            # em que permaneceu fora do monitoramento.
+            registro["status"] = STATUS_NOVO_HISTORICO_PENDENTE
+
             if bool(registro.get("historico_revisado")):
-                registro["status"] = STATUS_ATIVO_INCREMENTAL
                 registro["observacao"] = (
-                    "Processo reativado. O histórico já havia sido revisado; "
-                    "retornou ao modo incremental."
+                    "Processo reativado. Aguardando catch-up desde "
+                    "a última data DOU processada antes de retornar "
+                    "ao modo incremental."
                 )
             else:
-                registro["status"] = STATUS_NOVO_HISTORICO_PENDENTE
                 registro["observacao"] = (
-                    "Processo reativado com revisão histórica ainda pendente."
+                    "Processo reativado com revisão histórica "
+                    "ainda pendente."
                 )
 
             reativados.append(processo)
@@ -394,6 +398,7 @@ def obter_processos_historicos_pendentes() -> list[str]:
     return listar_processos_por_status(STATUS_NOVO_HISTORICO_PENDENTE)
 
 
+
 def marcar_historico_revisado(
     processo: str,
     *,
@@ -411,9 +416,23 @@ def marcar_historico_revisado(
         )
 
     data_revisao = converter_data_iso(data_revisao) or hoje_iso()
+
     ultima_data_dou_processada = converter_data_iso(
         ultima_data_dou_processada
     )
+
+    data_atual = converter_data_iso(
+        registro.get("ultima_data_dou_processada")
+    )
+
+    # Proteção monotônica:
+    # uma revisão histórica nunca pode fazer a última data retroceder.
+    if (
+        ultima_data_dou_processada
+        and data_atual
+        and ultima_data_dou_processada < data_atual
+    ):
+        ultima_data_dou_processada = data_atual
 
     registro["historico_revisado"] = True
     registro["historico_revisado_em"] = data_revisao
@@ -422,10 +441,11 @@ def marcar_historico_revisado(
     registro["ativo"] = True
     registro["ultima_data_dou_processada"] = (
         ultima_data_dou_processada
-        or registro.get("ultima_data_dou_processada")
+        or data_atual
     )
     registro["observacao"] = (
-        "Revisão histórica concluída. Processo promovido ao modo incremental."
+        "Revisão histórica concluída. "
+        "Processo promovido ao modo incremental."
     )
 
     estado["atualizado_em"] = agora_iso()
@@ -443,11 +463,93 @@ def registrar_execucao_incremental(
     processos: list[str] | tuple[str, ...],
     *,
     data_dou_processada: str,
+    processos_catchup_validados: (
+        list[str] | tuple[str, ...] | set[str] | None
+    ) = None,
 ) -> dict[str, Any]:
     estado = carregar_json_seguro(CAMINHO_CONTROLE)
     registros = estado.get("processos", {}) or {}
 
-    data_dou_processada = converter_data_iso(data_dou_processada)
+    data_dou_processada = converter_data_iso(
+        data_dou_processada
+    )
+
+    if not data_dou_processada:
+        raise ValueError(
+            "data_dou_processada deve ser uma data ISO v\u00e1lida."
+        )
+
+    data_nova_obj = dt.date.fromisoformat(
+        data_dou_processada
+    )
+
+    catchup_validados = set(
+        processos_catchup_validados or []
+    )
+
+    regressao_bloqueada: list[str] = []
+    sem_marco_bloqueado: list[str] = []
+    salto_bloqueado: list[str] = []
+    salto_validado: list[str] = []
+
+    # Preflight atomico:
+    # nenhum marco e alterado se existir lacuna sem catch-up validado.
+    for processo in processos:
+        registro = registros.get(processo)
+
+        if not isinstance(registro, dict):
+            continue
+
+        if registro.get("status") != STATUS_ATIVO_INCREMENTAL:
+            continue
+
+        data_atual = converter_data_iso(
+            registro.get("ultima_data_dou_processada")
+        )
+
+        if not data_atual:
+            if processo not in catchup_validados:
+                sem_marco_bloqueado.append(processo)
+            else:
+                salto_validado.append(processo)
+            continue
+
+        data_atual_obj = dt.date.fromisoformat(data_atual)
+
+        if data_nova_obj < data_atual_obj:
+            regressao_bloqueada.append(processo)
+            continue
+
+        if data_nova_obj > (
+            data_atual_obj + dt.timedelta(days=1)
+        ):
+            if processo in catchup_validados:
+                salto_validado.append(processo)
+            else:
+                salto_bloqueado.append(processo)
+
+    if sem_marco_bloqueado or salto_bloqueado:
+        detalhes = []
+
+        if sem_marco_bloqueado:
+            detalhes.append(
+                "sem marco anterior: "
+                + ", ".join(sem_marco_bloqueado)
+            )
+
+        if salto_bloqueado:
+            detalhes.append(
+                "salto de datas: "
+                + ", ".join(salto_bloqueado)
+            )
+
+        raise RuntimeError(
+            "Avan\u00e7o incremental bloqueado. "
+            "Execute o catch-up e valide toda a cobertura antes "
+            "de registrar a data corrente. "
+            + " | ".join(detalhes)
+        )
+
     instante = agora_iso()
     atualizados: list[str] = []
 
@@ -460,7 +562,19 @@ def registrar_execucao_incremental(
         if registro.get("status") != STATUS_ATIVO_INCREMENTAL:
             continue
 
-        registro["ultima_data_dou_processada"] = data_dou_processada
+        data_atual = converter_data_iso(
+            registro.get("ultima_data_dou_processada")
+        )
+
+        if (
+            data_atual
+            and data_dou_processada < data_atual
+        ):
+            continue
+
+        registro["ultima_data_dou_processada"] = (
+            data_dou_processada
+        )
         registro["ultima_execucao_incremental_em"] = instante
         atualizados.append(processo)
 
@@ -473,8 +587,15 @@ def registrar_execucao_incremental(
         "data_dou_processada": data_dou_processada,
         "processos_atualizados": len(atualizados),
         "processos": atualizados,
+        "regressoes_bloqueadas": len(regressao_bloqueada),
+        "processos_regressao_bloqueada": regressao_bloqueada,
+        "saltos_validados": len(salto_validado),
+        "processos_salto_validado": salto_validado,
+        "saltos_bloqueados": 0,
+        "processos_salto_bloqueado": [],
+        "sem_marco_bloqueados": 0,
+        "processos_sem_marco_bloqueado": [],
     }
-
 
 def imprimir_resultado(resultado: dict[str, Any]) -> None:
     print("=" * 80)

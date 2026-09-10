@@ -494,23 +494,383 @@ def salvar_resultado_final(
     return resumo
 
 
-def resolver_data_fim_historico() -> dt.date:
+
+
+def resolver_data_inicio_processo_pendente(
+    processo: str,
+) -> dt.date:
+    """
+    Processo realmente novo:
+        começa no início da cobertura INLABS.
+
+    Processo reativado e anteriormente revisado:
+        começa no dia seguinte à última data DOU processada.
+    """
     estado = carregar_controle(CAMINHO_CONTROLE)
+    registros = estado.get("processos", {}) or {}
 
-    valor = (
-        estado.get("ultima_data_dou_validada_baseline")
-        or estado.get("baseline_em")
-    )
+    registro = registros.get(processo)
 
-    if not valor:
-        raise RuntimeError(
-            "O controle não possui uma data final válida para o baseline."
+    if not isinstance(registro, dict):
+        raise KeyError(
+            f"Processo não encontrado no controle: {processo}"
         )
 
-    return dt.date.fromisoformat(str(valor))
+    inicio_padrao = (
+        runner_anual.DATA_INICIO_COBERTURA_INLABS
+    )
+
+    if not bool(registro.get("historico_revisado")):
+        return inicio_padrao
+
+    valor = str(
+        registro.get("ultima_data_dou_processada") or ""
+    ).strip()
+
+    if not valor:
+        return inicio_padrao
+
+    try:
+        ultima_data = dt.date.fromisoformat(valor)
+    except ValueError:
+        return inicio_padrao
+
+    return max(
+        ultima_data + dt.timedelta(days=1),
+        inicio_padrao,
+    )
 
 
-def executar(confirmar: bool = False) -> dict:
+def pesquisar_historico_dou_pendentes_por_faixa(
+    processos: tuple[str, ...],
+    data_fim: dt.date,
+) -> tuple[list[dict], dict]:
+    """
+    Pesquisa cada processo somente a partir da data que
+    realmente precisa de catch-up.
+
+    A base de cada dia é carregada uma única vez e, naquele dia,
+    são pesquisados somente os processos cuja faixa já começou.
+    """
+    inicios_por_processo = {
+        processo: resolver_data_inicio_processo_pendente(
+            processo
+        )
+        for processo in processos
+    }
+
+    inicios_validos = [
+        data_inicio
+        for data_inicio in inicios_por_processo.values()
+        if data_inicio <= data_fim
+    ]
+
+    sem_intervalo_pendente = [
+        processo
+        for processo, data_inicio
+        in inicios_por_processo.items()
+        if data_inicio > data_fim
+    ]
+
+    if not inicios_validos:
+        return [], {
+            "data_inicio": None,
+            "data_fim": data_fim.isoformat(),
+            "total_datas": 0,
+            "bases_existentes": 0,
+            "zips_reutilizados": 0,
+            "sem_publicacoes_confirmado": 0,
+            "total_erros": 0,
+            "erros": [],
+            "total_resultados": 0,
+            "inicios_por_processo": {
+                processo: data.isoformat()
+                for processo, data
+                in inicios_por_processo.items()
+            },
+            "processos_sem_intervalo_pendente": (
+                sem_intervalo_pendente
+            ),
+        }
+
+    data_inicio_global = min(inicios_validos)
+    datas = gerar_datas(
+        data_inicio_global,
+        data_fim,
+    )
+
+    resultados: list[dict] = []
+    chaves_vistas: set[str] = set()
+    erros: list[dict] = []
+
+    bases_existentes = 0
+    zips_reutilizados = 0
+    sem_publicacoes = 0
+
+    print("=" * 80)
+    print("REVISÃO HISTÓRICA / CATCH-UP DOU")
+    print("=" * 80)
+    print(
+        f"Período global: "
+        f"{data_inicio_global.isoformat()} a "
+        f"{data_fim.isoformat()}"
+    )
+    print(f"Processos pendentes: {len(processos)}")
+    print("=" * 80)
+
+    for indice, data_execucao in enumerate(
+        datas,
+        start=1,
+    ):
+        processos_data = tuple(
+            processo
+            for processo in processos
+            if inicios_por_processo[processo]
+            <= data_execucao
+        )
+
+        if not processos_data:
+            continue
+
+        registros, origem, erro = (
+            carregar_registros_dou_para_revisao(
+                data_execucao
+            )
+        )
+
+        print(
+            f"[{indice}/{len(datas)}] "
+            f"{data_execucao.isoformat()} | "
+            f"{origem} | "
+            f"processos={len(processos_data)}"
+        )
+
+        if erro:
+            erros.append({
+                "data": data_execucao.isoformat(),
+                "origem": origem,
+                "erro": erro,
+                "processos": list(processos_data),
+            })
+            continue
+
+        if origem == "BASE_DOU_EXISTENTE":
+            bases_existentes += 1
+        elif origem == "ZIPS_LOCAIS_REUTILIZADOS":
+            zips_reutilizados += 1
+        elif origem == "SEM_PUBLICACOES_CONFIRMADO":
+            sem_publicacoes += 1
+
+        resultados_data = pesquisar_processos_nos_registros(
+            registros=registros or [],
+            processos=processos_data,
+        )
+
+        for item in resultados_data:
+            if not isinstance(item, dict):
+                continue
+
+            chave = chave_resultado_dou(item)
+
+            if chave in chaves_vistas:
+                continue
+
+            chaves_vistas.add(chave)
+            resultados.append(item)
+
+    resultados.sort(
+        key=lambda item: (
+            item.get("data_publicacao") or "",
+            item.get("processo")
+            or item.get("processo_normalizado")
+            or "",
+            item.get("titulo") or "",
+        )
+    )
+
+    return resultados, {
+        "data_inicio": data_inicio_global.isoformat(),
+        "data_fim": data_fim.isoformat(),
+        "total_datas": len(datas),
+        "bases_existentes": bases_existentes,
+        "zips_reutilizados": zips_reutilizados,
+        "sem_publicacoes_confirmado": sem_publicacoes,
+        "total_erros": len(erros),
+        "erros": erros,
+        "total_resultados": len(resultados),
+        "inicios_por_processo": {
+            processo: data.isoformat()
+            for processo, data
+            in inicios_por_processo.items()
+        },
+        "processos_sem_intervalo_pendente": (
+            sem_intervalo_pendente
+        ),
+    }
+
+
+def resolver_data_fim_historico(
+    data_referencia: dt.date | None = None,
+) -> dt.date:
+    """
+    Define o ultimo dia da revisao historica.
+
+    Com data de referencia explicita, a revisao termina
+    na vespera dessa data. Sem referencia, usa a data atual.
+    """
+    referencia = data_referencia or dt.date.today()
+
+    referencia = min(
+        referencia,
+        runner_anual.DATA_FIM_LIMITE,
+    )
+
+    return referencia - dt.timedelta(days=1)
+
+def garantir_cobertura_dou_para_revisao(
+    data_inicio: dt.date,
+    data_fim: dt.date,
+) -> dict:
+    """
+    Garante que todas as datas da revisão histórica possuam
+    base DOU ou validação oficial de coleta.
+
+    Datas já válidas são reutilizadas.
+    Somente datas realmente ausentes são consultadas no INLABS.
+    Esta função não executa o consolidado anual de processos.
+    """
+    if data_fim < data_inicio:
+        return {
+            "status": "SUCESSO",
+            "total_datas": 0,
+            "datas_ja_cobertas": 0,
+            "datas_exigiram_coleta": 0,
+            "total_erros": 0,
+            "erros": [],
+        }
+
+    datas = gerar_datas(data_inicio, data_fim)
+
+    faltantes: list[dt.date] = []
+
+    for data_execucao in datas:
+        _, _, erro = carregar_registros_dou_para_revisao(
+            data_execucao
+        )
+
+        if erro:
+            faltantes.append(data_execucao)
+
+    print("=" * 80)
+    print("GARANTIA AUTOMÁTICA DE COBERTURA DOU")
+    print("=" * 80)
+    print(f"Datas do período: {len(datas)}")
+    print(f"Já cobertas: {len(datas) - len(faltantes)}")
+    print(f"Exigem coleta/validação INLABS: {len(faltantes)}")
+    print("=" * 80)
+
+    if not faltantes:
+        return {
+            "status": "SUCESSO",
+            "total_datas": len(datas),
+            "datas_ja_cobertas": len(datas),
+            "datas_exigiram_coleta": 0,
+            "total_erros": 0,
+            "erros": [],
+        }
+
+    sessao = None
+
+    try:
+        email, senha = runner_anual.obter_credenciais_inlabs()
+
+        sessao = runner_anual.criar_sessao_inlabs_com_tentativas(
+            email=email,
+            senha=senha,
+            max_tentativas=(
+                runner_anual.MAX_TENTATIVAS_LOGIN_PADRAO
+            ),
+        )
+
+        for indice, data_execucao in enumerate(
+            faltantes,
+            start=1,
+        ):
+            print(
+                f"[COBERTURA {indice}/{len(faltantes)}] "
+                f"{data_execucao.isoformat()}"
+            )
+
+            try:
+                runner_anual.baixar_data_com_sessao(
+                    session=sessao,
+                    data_execucao=data_execucao,
+                    reusar_zips_validos=True,
+                )
+            except Exception as erro:
+                print(
+                    f"[ERRO COBERTURA] "
+                    f"{data_execucao.isoformat()} | {erro}"
+                )
+
+    except Exception as erro:
+        return {
+            "status": "ERRO",
+            "total_datas": len(datas),
+            "datas_ja_cobertas": len(datas) - len(faltantes),
+            "datas_exigiram_coleta": len(faltantes),
+            "total_erros": len(faltantes),
+            "erros": [
+                {
+                    "data": data.isoformat(),
+                    "erro": (
+                        "Não foi possível obter sessão INLABS: "
+                        f"{erro}"
+                    ),
+                }
+                for data in faltantes
+            ],
+        }
+
+    finally:
+        if sessao is not None:
+            try:
+                sessao.close()
+            except Exception:
+                pass
+
+    erros: list[dict] = []
+
+    for data_execucao in faltantes:
+        _, origem, erro = carregar_registros_dou_para_revisao(
+            data_execucao
+        )
+
+        if erro:
+            erros.append({
+                "data": data_execucao.isoformat(),
+                "origem": origem,
+                "erro": erro,
+            })
+
+    return {
+        "status": (
+            "SUCESSO"
+            if not erros
+            else "CONCLUIDO_COM_PENDENCIAS"
+        ),
+        "total_datas": len(datas),
+        "datas_ja_cobertas": len(datas) - len(faltantes),
+        "datas_exigiram_coleta": len(faltantes),
+        "total_erros": len(erros),
+        "erros": erros,
+    }
+
+
+def executar(
+    confirmar: bool = False,
+    data_referencia: dt.date | None = None,
+) -> dict:
     sincronizacao = sincronizar_com_planilha()
     processos = tuple(obter_processos_historicos_pendentes())
 
@@ -535,14 +895,42 @@ def executar(confirmar: bool = False) -> dict:
     # As funções Anvisa do runner anual usam esta variável global.
     runner_anual.PROCESSOS_PESQUISA = processos
 
-    data_inicio = runner_anual.DATA_INICIO_COBERTURA_INLABS
-    data_fim = resolver_data_fim_historico()
+    data_fim = resolver_data_fim_historico(
+        data_referencia=data_referencia,
+    )
 
-    resultados_dou, resumo_dou = pesquisar_historico_dou(
-        processos=processos,
-        data_inicio=data_inicio,
+    inicios_por_processo = {
+        processo: resolver_data_inicio_processo_pendente(
+            processo
+        )
+        for processo in processos
+    }
+
+    inicios_necessarios = [
+        data_inicio
+        for data_inicio in inicios_por_processo.values()
+        if data_inicio <= data_fim
+    ]
+
+    data_inicio_cobertura = (
+        min(inicios_necessarios)
+        if inicios_necessarios
+        else data_fim + dt.timedelta(days=1)
+    )
+
+    resumo_cobertura = garantir_cobertura_dou_para_revisao(
+        data_inicio=data_inicio_cobertura,
         data_fim=data_fim,
     )
+
+    resultados_dou, resumo_dou = (
+        pesquisar_historico_dou_pendentes_por_faixa(
+            processos=processos,
+            data_fim=data_fim,
+        )
+    )
+
+    resumo_dou["cobertura_automatica"] = resumo_cobertura
 
     try:
         resultados_anvisa, resumo_anvisa = (
@@ -561,7 +949,8 @@ def executar(confirmar: bool = False) -> dict:
         }
 
     erros_totais = (
-        int(resumo_dou.get("total_erros") or 0)
+        int(resumo_cobertura.get("total_erros") or 0)
+        + int(resumo_dou.get("total_erros") or 0)
         + int(resumo_anvisa.get("total_erros") or 0)
     )
 

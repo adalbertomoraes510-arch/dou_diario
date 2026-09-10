@@ -32,6 +32,11 @@ from backend.services.controle_monitoramento_processos_service import (
 from backend.services.pesquisa_processos_dou_service import (
     pesquisar_processos_nos_registros,
 )
+from backend.runners.run_revisao_historica_processos_pendentes_2026 import (
+    garantir_cobertura_dou_para_revisao,
+    pesquisar_historico_dou_pendentes_por_faixa,
+    resolver_data_inicio_processo_pendente,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -208,6 +213,105 @@ def simplificar_resultado(item: dict) -> dict:
     }
 
 
+
+def executar_catchup_ativos_se_necessario(
+    *,
+    processos: tuple[str, ...],
+    data_execucao: dt.date,
+) -> tuple[list[dict], dict]:
+    """
+    Garante que cada processo ativo esteja coberto ate a vespera
+    da data incremental que sera processada.
+
+    Somente processos realmente atrasados entram no catch-up.
+    O marco do controle nao e alterado aqui.
+    """
+    data_fim = data_execucao - dt.timedelta(days=1)
+
+    inicios_por_processo = {
+        processo: resolver_data_inicio_processo_pendente(
+            processo
+        )
+        for processo in processos
+    }
+
+    processos_atrasados = tuple(
+        processo
+        for processo, data_inicio
+        in inicios_por_processo.items()
+        if data_inicio <= data_fim
+    )
+
+    if not processos_atrasados:
+        return [], {
+            "status": "SEM_CATCHUP_NECESSARIO",
+            "data_fim": data_fim.isoformat(),
+            "total_processos": 0,
+            "processos": [],
+            "total_datas": 0,
+            "total_resultados": 0,
+            "total_erros": 0,
+            "processos_catchup_validados": [],
+        }
+
+    data_inicio = min(
+        inicios_por_processo[processo]
+        for processo in processos_atrasados
+    )
+
+    print("=" * 80)
+    print("CATCH-UP AUTOMATICO DE PROCESSOS ATIVOS")
+    print("=" * 80)
+    print(
+        f"Periodo: {data_inicio.isoformat()} "
+        f"a {data_fim.isoformat()}"
+    )
+    print(
+        f"Processos atrasados: {len(processos_atrasados)}"
+    )
+    print("=" * 80)
+
+    cobertura = garantir_cobertura_dou_para_revisao(
+        data_inicio=data_inicio,
+        data_fim=data_fim,
+    )
+
+    resultados, pesquisa = (
+        pesquisar_historico_dou_pendentes_por_faixa(
+            processos=processos_atrasados,
+            data_fim=data_fim,
+        )
+    )
+
+    total_erros = (
+        int(cobertura.get("total_erros") or 0)
+        + int(pesquisa.get("total_erros") or 0)
+    )
+
+    if total_erros:
+        raise RuntimeError(
+            "Catch-up dos processos ativos possui pendencias "
+            "tecnicas. O marco incremental nao sera avancado. "
+            f"Erros: {total_erros}"
+        )
+
+    return resultados, {
+        "status": "CATCHUP_VALIDADO",
+        "data_inicio": data_inicio.isoformat(),
+        "data_fim": data_fim.isoformat(),
+        "total_processos": len(processos_atrasados),
+        "processos": list(processos_atrasados),
+        "total_datas": pesquisa.get("total_datas", 0),
+        "total_resultados": len(resultados),
+        "total_erros": 0,
+        "cobertura": cobertura,
+        "pesquisa": pesquisa,
+        "processos_catchup_validados": list(
+            processos_atrasados
+        ),
+    }
+
+
 def salvar_resultados(
     *,
     data_execucao: dt.date,
@@ -216,6 +320,7 @@ def salvar_resultados(
     resultados: list[dict],
     sincronizacao: dict,
     controle_atualizado: dict,
+    resumo_catchup: dict,
 ) -> dict:
     PASTA_POR_DATA.mkdir(parents=True, exist_ok=True)
 
@@ -244,6 +349,7 @@ def salvar_resultados(
             "reativados": sincronizacao.get("reativados", []),
         },
         "controle_incremental": controle_atualizado,
+        "catchup_automatico": resumo_catchup,
     }
 
     salvar_json_atomico(
@@ -292,8 +398,14 @@ def salvar_resultados(
         f"Processos ativos pesquisados: {len(processos)}",
         f"Registros da base diária: {len(registros)}",
         f"Resultados encontrados: {len(resultados_simplificados)}",
-        "Datas históricas reprocessadas: 0",
-        "Acesso ao INLABS realizado por este runner: NÃO",
+        (
+            "Datas de catch-up pesquisadas: "
+            f"{resumo_catchup.get('total_datas', 0)}"
+        ),
+        (
+            "INLABS no catch-up: somente quando existir "
+            "lacuna de cobertura."
+        ),
         "Pesquisa Anvisa realizada por este runner: NÃO",
         "-" * 80,
         f"JSON: {caminho_resultado_json(data_execucao)}",
@@ -326,12 +438,17 @@ def executar(data_execucao: dt.date) -> dict:
     validar_data(data_execucao)
 
     print("=" * 80)
-    print("PESQUISA INCREMENTAL DIÁRIA DE PROCESSOS — DOU — 2026")
+    print("PESQUISA INCREMENTAL DIARIA DE PROCESSOS - DOU - 2026")
     print("=" * 80)
     print(f"Data: {data_execucao.isoformat()}")
-    print("Regra: pesquisar somente a base DOU desta data.")
-    print("Downloads INLABS nesta etapa: 0")
-    print("Pesquisa histórica nesta etapa: 0")
+    print(
+        "Regra: catch-up automatico ate a vespera "
+        "antes da pesquisa da data corrente."
+    )
+    print(
+        "INLABS: somente para preencher lacunas "
+        "de cobertura detectadas no catch-up."
+    )
     print("Pesquisa Anvisa nesta etapa: 0")
     print("=" * 80)
 
@@ -343,8 +460,8 @@ def executar(data_execucao: dt.date) -> dict:
 
     if pendentes > 0:
         raise RuntimeError(
-            "Existem processos com revisão histórica pendente. "
-            "Execute primeiro o runner de sincronização histórica. "
+            "Existem processos com revisao historica pendente. "
+            "Execute primeiro o runner de sincronizacao historica. "
             f"Pendentes: {pendentes}"
         )
 
@@ -374,25 +491,53 @@ def executar(data_execucao: dt.date) -> dict:
             "SEM_PUBLICACOES_CONFIRMADO",
         }:
             raise RuntimeError(
-                "A base diária foi encontrada, mas não contém registros "
-                "nem indicação confirmada de ausência de publicações. "
+                "A base diaria foi encontrada, mas nao contem "
+                "registros nem indicacao confirmada de ausencia "
+                "de publicacoes. "
                 f"Base: {caminho_base}"
             )
 
+    resultados_catchup, resumo_catchup = (
+        executar_catchup_ativos_se_necessario(
+            processos=processos,
+            data_execucao=data_execucao,
+        )
+    )
+
     print(f"Processos ativos: {len(processos)}")
-    print(f"Registros na base diária: {len(registros)}")
+    print(f"Registros na base diaria: {len(registros)}")
+    print(
+        "Processos com catch-up: "
+        f"{resumo_catchup.get('total_processos', 0)}"
+    )
     print("=" * 80)
 
-    resultados = pesquisar_processos_nos_registros(
+    resultados_dia = pesquisar_processos_nos_registros(
         registros=registros,
         processos=processos,
     )
-    resultados = remover_duplicados(resultados)
 
-    # O controle só avança depois de a pesquisa terminar sem erro.
+    resultados = remover_duplicados(
+        list(resultados_catchup) + list(resultados_dia)
+    )
+
+    processos_catchup_validados = (
+        resumo_catchup.get(
+            "processos_catchup_validados",
+            [],
+        )
+        or []
+    )
+
+    # O controle avanca uma unica vez, somente depois de:
+    # 1. catch-up sem erro;
+    # 2. pesquisa da data corrente sem erro.
     controle_atualizado = registrar_execucao_incremental(
         processos=processos,
         data_dou_processada=data_execucao.isoformat(),
+        processos_catchup_validados=(
+            processos_catchup_validados
+        ),
     )
 
     resumo = salvar_resultados(
@@ -402,10 +547,11 @@ def executar(data_execucao: dt.date) -> dict:
         resultados=resultados,
         sincronizacao=sincronizacao,
         controle_atualizado=controle_atualizado,
+        resumo_catchup=resumo_catchup,
     )
 
     print("=" * 80)
-    print("PESQUISA INCREMENTAL DIÁRIA CONCLUÍDA")
+    print("PESQUISA INCREMENTAL DIARIA CONCLUIDA")
     print("=" * 80)
     print(f"Status: {resumo['status']}")
     print(f"Data pesquisada: {resumo['data_execucao']}")
@@ -414,20 +560,29 @@ def executar(data_execucao: dt.date) -> dict:
         f"{resumo['total_processos_ativos']}"
     )
     print(
-        "Registros da base diária: "
+        "Registros da base diaria: "
         f"{resumo['total_registros_base']}"
     )
+    print(
+        "Datas de catch-up pesquisadas: "
+        f"{resumo_catchup.get('total_datas', 0)}"
+    )
+    print(
+        "Processos com catch-up validado: "
+        f"{len(processos_catchup_validados)}"
+    )
     print(f"Resultados encontrados: {resumo['total_resultados']}")
-    print("Datas históricas reprocessadas: 0")
-    print("Acesso ao INLABS por este runner: NÃO")
-    print("Pesquisa Anvisa por este runner: NÃO")
+    print(
+        "INLABS no catch-up: somente quando existir "
+        "lacuna de cobertura."
+    )
+    print("Pesquisa Anvisa por este runner: NAO")
     print(f"JSON: {caminho_resultado_json(data_execucao)}")
     print(f"CSV: {caminho_resultado_csv(data_execucao)}")
     print(f"TXT: {caminho_resultado_txt(data_execucao)}")
     print("=" * 80)
 
     return resumo
-
 
 def montar_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(

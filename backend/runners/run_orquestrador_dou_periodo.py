@@ -1061,7 +1061,9 @@ def tentar_enviar_email_dou_diario_item(
 # MONITORAMENTO INCREMENTAL DE PROCESSOS — EXECUÇÃO SEGURA
 # ============================================================
 
-async def executar_sincronizacao_processos_incremental_segura() -> dict:
+async def executar_sincronizacao_processos_incremental_segura(
+    data_referencia: datetime.date | None = None,
+) -> dict:
     """
     Sincroniza a planilha com o controle e revisa o histórico somente dos
     processos novos. Processos já ativos não têm o acervo anual reprocessado.
@@ -1079,7 +1081,8 @@ async def executar_sincronizacao_processos_incremental_segura() -> dict:
 
     try:
         resultado = await asyncio.to_thread(
-            executar_sincronizacao_processos_incremental
+            executar_sincronizacao_processos_incremental,
+            data_referencia=data_referencia,
         )
         resultado["controle_email_historico"] = (
             registrar_historico_novos_processos_seguro(
@@ -1825,7 +1828,9 @@ async def main() -> None:
         # Executado uma única vez por chamada do runner.
         # Se houver processo novo, somente ele passa pela revisão histórica.
         resultado_sincronizacao_processos = (
-            await executar_sincronizacao_processos_incremental_segura()
+            await executar_sincronizacao_processos_incremental_segura(
+                data_referencia=data_inicio,
+            )
         )
 
         # A Anvisa é executada antes dos itens diários para que qualquer

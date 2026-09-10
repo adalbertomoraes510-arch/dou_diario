@@ -15,6 +15,7 @@ Responsabilidades desta etapa:
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import traceback
 from pathlib import Path
@@ -63,7 +64,9 @@ def salvar_json(caminho: Path, payload: dict[str, Any]) -> None:
     temporario.replace(caminho)
 
 
-def executar() -> dict[str, Any]:
+def executar(
+    data_referencia: dt.date | None = None,
+) -> dict[str, Any]:
     print("=" * 80)
     print("SINCRONIZAÇÃO AUTOMÁTICA DE PROCESSOS — 2026")
     print("=" * 80)
@@ -121,6 +124,7 @@ def executar() -> dict[str, Any]:
     try:
         revisao = executar_revisao_historica_pendentes(
             confirmar=True,
+            data_referencia=data_referencia,
         )
 
         resultado = {
