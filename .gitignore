@@ -94,3 +94,6 @@ backend/output/**
 !backend/output/
 !backend/output/**/
 !backend/output/**/.gitkeep
+
+# Dados e historicos locais do painel operacional
+/backend/data/painel_operacional/
