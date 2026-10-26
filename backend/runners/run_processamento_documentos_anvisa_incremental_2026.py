@@ -4,7 +4,7 @@ Runner isolado — processamento incremental de documentos Anvisa/Dicol — 2026
 
 Objetivo desta etapa:
 - selecionar somente documentos com status NOVO_PENDENTE;
-- pesquisar somente os processos ATIVO_INCREMENTAL;
+- pesquisar TODOS os processos ativos da planilha, inclusive historico pendente;
 - baixar e processar apenas os documentos novos;
 - reutilizar OCR quando aplicável;
 - manter documento pendente quando ocorrer erro, permitindo nova tentativa;
@@ -22,6 +22,9 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import os
+import shutil
+import sys
 import traceback
 from pathlib import Path
 from typing import Any
@@ -36,10 +39,14 @@ from backend.services.controle_documentos_anvisa_service import (
     montar_resumo,
     salvar_json_atomico,
 )
+from backend.services.conciliacao_dicol_diaria_service import conciliar_dicol_diaria
 from backend.services.controle_monitoramento_processos_service import (
+    CAMINHO_CONTROLE as CAMINHO_CONTROLE_PROCESSOS,
+    STATUS_INATIVO,
+    carregar_json_seguro,
+    carregar_processos_atuais,
     obter_processos_ativos_incrementais,
     obter_processos_historicos_pendentes,
-    sincronizar_com_planilha,
 )
 
 
@@ -57,6 +64,7 @@ PASTA_SAIDA = (
 
 PASTA_POR_DATA = PASTA_SAIDA / "por_data"
 PASTA_LOGS = PASTA_SAIDA / "logs"
+PASTA_DIARIO_DOCUMENTOS = PASTA_SAIDA / "resultados_por_documento"
 
 
 def agora_iso() -> str:
@@ -108,6 +116,135 @@ def calcular_sha256(caminho: Path) -> str:
             hash_obj.update(bloco)
 
     return hash_obj.hexdigest()
+
+
+def validar_carteira_sem_sincronizar() -> dict[str, Any]:
+    """Verifica correspondencia com a planilha, sem atualizar o cadastro.
+
+    A sincronizacao efetiva (novos, inativos e reativados) e uma operacao
+    independente e deve ser revisada antes de processar PDFs.
+    """
+    cadastro = carregar_json_seguro(CAMINHO_CONTROLE_PROCESSOS)
+    registrados = cadastro.get("processos", {})
+    if not isinstance(registrados, dict):
+        raise RuntimeError("Cadastro de processos: estrutura invalida")
+    atuais = tuple(carregar_processos_atuais())
+    if not atuais:
+        raise RuntimeError("Planilha PROCESSOS vazia; processamento bloqueado")
+    ativos = {
+        str(processo)
+        for processo, registro in registrados.items()
+        if isinstance(registro, dict)
+        and str(registro.get("status") or "") != STATUS_INATIVO
+        and bool(registro.get("ativo", True))
+    }
+    planilha = set(atuais)
+    if planilha != ativos:
+        diferencas = {
+            "novos_na_planilha": sorted(planilha - ativos),
+            "ausentes_na_planilha": sorted(ativos - planilha),
+        }
+        raise RuntimeError(
+            "ABORTADO: planilha e carteira de monitoramento divergentes. "
+            "Nao houve sincronizacao automatica: "
+            + json.dumps(diferencas, ensure_ascii=False)
+        )
+    return {"status": "CONFERIDO_SOMENTE_LEITURA", "total": len(ativos)}
+
+
+def validar_diagnostico_pdf(diagnostico: dict[str, Any]) -> None:
+    """Nunca marcar sucesso sem texto pesquisavel e cobertura integral."""
+    if not isinstance(diagnostico, dict):
+        raise RuntimeError("Diagnostico PDF inexistente/invalido")
+    estado = str(diagnostico.get("status_leitura") or "")
+    if estado not in {"TEXTO_EXTRAIDO", "TEXTO_EXTRAIDO_OCR"}:
+        raise RuntimeError(
+            "PDF sem texto pesquisavel confirmado; OCR pendente ou falhou: "
+            f"status_leitura={estado!r}; "
+            f"ocr_erro={diagnostico.get('ocr_erro')!r}"
+        )
+    if str(diagnostico.get("ocr_status") or "").upper() == "ERRO":
+        raise RuntimeError("OCR falhou: " + str(diagnostico.get("ocr_erro") or ""))
+    total = int(diagnostico.get("total_paginas") or 0)
+    com_texto = int(diagnostico.get("paginas_com_texto") or 0)
+    erros = int(diagnostico.get("erros_paginas") or 0)
+    caracteres = int(diagnostico.get("caracteres_extraidos") or 0)
+    if total <= 0 or com_texto < total or erros > 0 or caracteres <= 0:
+        raise RuntimeError(
+            "Cobertura do texto PDF incompleta; manter pendente: "
+            f"paginas_com_texto={com_texto}/{total}; "
+            f"erros_paginas={erros}; caracteres={caracteres}"
+        )
+
+
+def caminho_diario_documento(chave: str) -> Path:
+    if len(chave) != 64 or any(c not in "0123456789abcdef" for c in chave.lower()):
+        raise ValueError("Chave de documento nao e SHA-256")
+    return PASTA_DIARIO_DOCUMENTOS / (chave.lower() + ".json")
+
+
+def criar_backup_controle() -> Path:
+    """Backup identico do controle imediatamente antes de alterar status."""
+    origem = CAMINHO_CONTROLE_INCREMENTAL
+    instante = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    destino = origem.with_name(origem.name + ".backup_pre_processamento_seguro_" + instante)
+    if destino.exists():
+        raise RuntimeError("Backup ja existente: " + str(destino))
+    shutil.copy2(origem, destino)
+    if calcular_sha256(origem) != calcular_sha256(destino):
+        raise RuntimeError("Backup diverge do controle; abortado")
+    print("[ANVISA] Backup validado:", destino)
+    return destino
+
+
+def carregar_resultado_existente(data_execucao: str) -> dict[str, Any]:
+    caminho = caminho_resultado_json(data_execucao)
+    if not caminho.exists():
+        return {"resultados": [], "resumo": {}}
+    anterior = carregar_json(caminho)
+    if not isinstance(anterior.get("resultados"), list):
+        raise RuntimeError("Relatorio diario existente invalido; nao sobrescrever")
+    if not isinstance(anterior.get("resumo"), dict):
+        raise RuntimeError("Resumo diario existente invalido; nao sobrescrever")
+    return anterior
+
+
+def recuperar_diarios_processados(controle: dict[str, Any], data_execucao: str):
+    """Recupera resultados em disco apos interrupcao, sem reler PDFs."""
+    resultados = []
+    detalhes = []
+    for chave, registro in controle.get("documentos", {}).items():
+        if not isinstance(registro, dict):
+            continue
+        if registro.get("status") != STATUS_PROCESSADO_INCREMENTAL:
+            continue
+        if not str(registro.get("processado_em") or "").startswith(data_execucao):
+            continue
+        caminho = caminho_diario_documento(str(chave))
+        if not caminho.exists():
+            if registro.get("resultado_journal"):
+                raise RuntimeError("Registro processado sem seu diario duravel: " + str(chave))
+            continue  # registros antigos, anteriores a esta correcao
+        bruto = carregar_json(caminho)
+        if bruto.get("chave_documento") != chave:
+            raise RuntimeError("Diario de documento com chave inconsistente: " + str(chave))
+        itens = bruto.get("resultados")
+        detalhe = bruto.get("documento_processado")
+        if not isinstance(itens, list) or not isinstance(detalhe, dict):
+            raise RuntimeError("Diario de documento invalido: " + str(chave))
+        resultados.extend(itens)
+        detalhes.append(detalhe)
+    return resultados, detalhes
+
+
+def unificar_detalhes(detalhes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    vistos = {}
+    for item in detalhes:
+        chave = str(item.get("chave_documento") or "")
+        if not chave:
+            raise RuntimeError("Detalhe do processamento sem chave_documento")
+        vistos[chave] = item
+    return list(vistos.values())
 
 
 def selecionar_documentos_pendentes(
@@ -218,12 +355,37 @@ def salvar_resultados(
     PASTA_POR_DATA.mkdir(parents=True, exist_ok=True)
     PASTA_LOGS.mkdir(parents=True, exist_ok=True)
 
-    resultados = remover_resultados_duplicados(resultados)
+    anterior = carregar_resultado_existente(data_execucao)
+    journal_resultados, journal_detalhes = recuperar_diarios_processados(
+        controle, data_execucao
+    )
+    resultados = remover_resultados_duplicados(
+        list(anterior["resultados"]) + journal_resultados + resultados
+    )
+    detalhes_anteriores = anterior["resumo"].get("documentos_processados_detalhes", [])
+    if not isinstance(detalhes_anteriores, list):
+        raise RuntimeError("Detalhes de relatorio anterior invalidos")
+    documentos_processados = unificar_detalhes(
+        detalhes_anteriores + journal_detalhes + documentos_processados
+    )
+    # Falhas superadas nao devem manter status de pendencia indefinidamente.
+    erros_anteriores = anterior["resumo"].get("erros", [])
+    if not isinstance(erros_anteriores, list):
+        raise RuntimeError("Erros anteriores invalidos")
+    chaves_processadas = {x["chave_documento"] for x in documentos_processados}
+    erros_combinados = {}
+    for item in erros_anteriores + documentos_com_erro:
+        chave = str(item.get("chave_documento") or "")
+        if chave and chave not in chaves_processadas:
+            erros_combinados[chave] = item
+    documentos_com_erro = list(erros_combinados.values())
 
     status = (
-        "SUCESSO"
-        if not documentos_com_erro
-        else "CONCLUIDO_COM_PENDENCIAS"
+        "CONCLUIDO_COM_PENDENCIAS"
+        if documentos_com_erro
+        else "SEM_DOCUMENTOS_NOVOS_PENDENTES"
+        if documentos_pendentes_iniciais == 0
+        else "SUCESSO"
     )
 
     resumo = {
@@ -232,6 +394,9 @@ def salvar_resultados(
         "modo": "ANVISA_INCREMENTAL",
         "data_execucao": data_execucao,
         "total_processos_ativos": len(processos),
+        "processos_elegiveis": list(processos),
+        "comprovacao_individual": "VERIFICAR_PROCESSOS_PESQUISADOS_EM_CADA_DIARIO_DE_DOCUMENTO",
+        "cobertura_individual_consolidada": False,
         "documentos_pendentes_iniciais": documentos_pendentes_iniciais,
         "documentos_processados": len(documentos_processados),
         "documentos_com_erro": len(documentos_com_erro),
@@ -251,11 +416,6 @@ def salvar_resultados(
         caminho_resultado_json(data_execucao),
         payload,
     )
-    salvar_json_atomico(
-        caminho_status_execucao(data_execucao),
-        resumo,
-    )
-
     campos = [
         "fonte",
         "processo",
@@ -274,7 +434,9 @@ def salvar_resultados(
         "processado_em",
     ]
 
-    with caminho_resultado_csv(data_execucao).open(
+    destino_csv = caminho_resultado_csv(data_execucao)
+    temporario_csv = destino_csv.with_suffix(destino_csv.suffix + ".tmp")
+    with temporario_csv.open(
         "w",
         encoding="utf-8-sig",
         newline="",
@@ -287,6 +449,7 @@ def salvar_resultados(
         )
         escritor.writeheader()
         escritor.writerows(resultados)
+    os.replace(temporario_csv, destino_csv)
 
     linhas = [
         "=" * 80,
@@ -311,11 +474,12 @@ def salvar_resultados(
         "=" * 80,
     ]
 
-    caminho_resultado_txt(data_execucao).write_text(
-        "\n".join(linhas),
-        encoding="utf-8",
-    )
+    destino_txt = caminho_resultado_txt(data_execucao)
+    temporario_txt = destino_txt.with_suffix(destino_txt.suffix + ".tmp")
+    temporario_txt.write_text("\n".join(linhas), encoding="utf-8")
+    os.replace(temporario_txt, destino_txt)
 
+    salvar_json_atomico(caminho_status_execucao(data_execucao), resumo)
     return resumo
 
 
@@ -326,60 +490,72 @@ def executar() -> dict[str, Any]:
     print("=" * 80)
     print("PROCESSAMENTO INCREMENTAL DE DOCUMENTOS ANVISA — 2026")
     print("=" * 80)
-    print("Regra: processar somente documentos NOVO_PENDENTE.")
+    print("Regra: processar documentos NOVO_PENDENTE para TODA a planilha.")
+    print("Carteira de processos: SOMENTE LEITURA (sem sincronizacao automatica)")
+    print("Confiabilidade PDF: falha OCR/cobertura incompleta mantem pendente")
+    print("Resultados: diarios por documento antes de marcar processado")
     print("Documentos do baseline reprocessados: 0")
     print("Pesquisa DOU: NÃO")
     print("Envio de e-mail: NÃO")
     print("=" * 80)
 
-    sincronizacao = sincronizar_com_planilha()
+    conferencia = validar_carteira_sem_sincronizar()
+    print("[ANVISA] Carteira conferida sem sincronizacao/gravar:", conferencia["total"])
+    # Nao permitir sobrescrever um relatorio diario danificado.
+    carregar_resultado_existente(data_execucao)
     historicos_pendentes = obter_processos_historicos_pendentes()
 
     if historicos_pendentes:
-        raise RuntimeError(
-            "Existem processos com revisão histórica pendente. "
-            "Execute primeiro a sincronização/revisão histórica. "
-            f"Pendentes: {len(historicos_pendentes)}"
+        print(
+            f"[ANVISA] {len(historicos_pendentes)} processo(s) aguardam "
+            "revisao historica, MAS participam da pesquisa incremental. "
+            "O status historico nao sera alterado."
         )
 
-    processos = tuple(obter_processos_ativos_incrementais())
-
+    # A correspondencia entre planilha e carteira foi conferida acima.
+    # O status de revisao historica NAO filtra a pesquisa de documentos novos.
+    processos = tuple(carregar_processos_atuais())
     if not processos:
-        raise RuntimeError(
-            "Nenhum processo ATIVO_INCREMENTAL foi encontrado."
-        )
+        raise RuntimeError("Planilha PROCESSOS vazia; processamento bloqueado")
 
     controle = carregar_json(CAMINHO_CONTROLE_INCREMENTAL)
     pendentes = selecionar_documentos_pendentes(controle)
 
-    print(f"Processos ativos: {len(processos)}")
+    print(f"Processos elegiveis dos PDFs novos: {len(processos)}")
     print(f"Documentos NOVO_PENDENTE: {len(pendentes)}")
     print("=" * 80)
 
     if not pendentes:
-        resumo = salvar_resultados(
-            data_execucao=data_execucao,
-            processos=processos,
-            documentos_pendentes_iniciais=0,
-            documentos_processados=[],
-            documentos_com_erro=[],
-            resultados=[],
-            controle=controle,
-        )
-        resumo["status"] = "SEM_DOCUMENTOS_NOVOS_PENDENTES"
-
-        salvar_json_atomico(
-            caminho_status_execucao(data_execucao),
-            resumo,
-        )
-
+        # Importante: uma execucao sem documentos novos NAO comprova a
+        # pesquisa de 36 processos em PDFs antigos. Nao sobrescrever o
+        # relatorio do dia (que pode registrar apenas 31 processos).
+        anterior = caminho_resultado_json(data_execucao).is_file()
+        resumo = {
+            "status": "SEM_DOCUMENTOS_NOVOS_PENDENTES",
+            "data_execucao": data_execucao,
+            "processos_elegiveis": len(processos),
+            "total_processos_ativos": len(processos),
+            "documentos_pendentes_iniciais": 0,
+            "documentos_processados": 0,
+            "documentos_com_erro": 0,
+            "total_resultados": 0,
+            "relatorio_anterior_preservado": anterior,
+            "pesquisa_individual_comprovada_nesta_execucao": False,
+        }
         print("Nenhum documento novo exige processamento.")
-        print("Nenhum PDF foi baixado.")
-        print("Nenhum OCR foi executado.")
-        print(f"Status: {caminho_status_execucao(data_execucao)}")
+        print("Nenhuma pesquisa de processo foi executada nesta chamada.")
+        print("Relatorios anteriores preservados: ", anterior)
+        resumo["controle_diario"] = conciliar_dicol_diaria(
+            data=data_execucao, processos=processos, controle=controle
+        )
+        print("Conciliacao diaria DICOL:", resumo["controle_diario"]["status"])
+        print("Nenhum PDF foi baixado e nenhum OCR foi executado.")
         print("=" * 80)
-
         return resumo
+
+    if not controle.get("baseline_inicializado"):
+        raise RuntimeError("Baseline ANVISA nao inicializado")
+    criar_backup_controle()
 
     runner_anual.PROCESSOS_PESQUISA = processos
 
@@ -419,9 +595,34 @@ def executar() -> dict[str, Any]:
                 )
 
                 documento.pop("_forcar_ocr", None)
-
+                validar_diagnostico_pdf(diagnostico)
                 hash_conteudo = calcular_sha256(caminho_pdf)
 
+                resultados_simplificados = [
+                    simplificar_resultado(item, processado_em=processado_em)
+                    for item in resultados_pdf
+                ]
+                detalhe = {
+                    "chave_documento": chave,
+                    "fonte": documento.get("fonte"),
+                    "titulo": documento.get("titulo"),
+                    "url_pdf": documento.get("url_pdf"),
+                    "arquivo_pdf": str(caminho_pdf),
+                    "status_leitura": diagnostico.get("status_leitura"),
+                    "ocr_aplicado": diagnostico.get("ocr_aplicado"),
+                    "resultados": len(resultados_pdf),
+                    "processado_em": processado_em,
+                }
+                journal = caminho_diario_documento(chave)
+                salvar_json_atomico(journal, {
+                    "chave_documento": chave,
+                    "hash_conteudo": hash_conteudo,
+                    "processos_pesquisados": list(processos),
+                    "diagnostico_pdf": diagnostico,
+                    "documento_processado": detalhe,
+                    "resultados": resultados_simplificados,
+                })
+                # Somente marcar PROCESSADO apos guardar os resultados duravelmente.
                 registro["status"] = STATUS_PROCESSADO_INCREMENTAL
                 registro["processado"] = True
                 registro["processado_em"] = processado_em
@@ -435,42 +636,18 @@ def executar() -> dict[str, Any]:
                 registro["status_leitura"] = str(
                     diagnostico.get("status_leitura") or ""
                 )
-                registro["ocr_aplicado"] = bool(
-                    diagnostico.get("ocr_aplicado")
-                )
+                registro["ocr_aplicado"] = bool(diagnostico.get("ocr_aplicado"))
                 registro["hash_conteudo"] = hash_conteudo
-                registro["total_resultados_incremental"] = len(
-                    resultados_pdf
-                )
+                registro["total_resultados_incremental"] = len(resultados_pdf)
+                registro["resultado_journal"] = str(journal)
                 registro["ultimo_erro"] = None
-                registro["ultima_tentativa_processamento_em"] = (
-                    processado_em
-                )
+                registro["ultima_tentativa_processamento_em"] = processado_em
                 registro["observacao"] = (
-                    "Documento novo processado com sucesso no fluxo "
-                    "incremental."
+                    "Documento processado com texto pesquisavel, "
+                    "resultados registrados em diario duravel."
                 )
-
-                resultados_simplificados = [
-                    simplificar_resultado(
-                        item,
-                        processado_em=processado_em,
-                    )
-                    for item in resultados_pdf
-                ]
                 resultados_finais.extend(resultados_simplificados)
-
-                documentos_processados.append({
-                    "chave_documento": chave,
-                    "fonte": documento.get("fonte"),
-                    "titulo": documento.get("titulo"),
-                    "url_pdf": documento.get("url_pdf"),
-                    "arquivo_pdf": str(caminho_pdf),
-                    "status_leitura": diagnostico.get("status_leitura"),
-                    "ocr_aplicado": diagnostico.get("ocr_aplicado"),
-                    "resultados": len(resultados_pdf),
-                    "processado_em": processado_em,
-                })
+                documentos_processados.append(detalhe)
 
             except Exception as erro:
                 registro["status"] = STATUS_NOVO_PENDENTE
@@ -556,6 +733,10 @@ def executar() -> dict[str, Any]:
         "Resultados encontrados: "
         f"{resumo['total_resultados']}"
     )
+    resumo["controle_diario"] = conciliar_dicol_diaria(
+        data=data_execucao, processos=processos, controle=controle
+    )
+    print("Conciliacao diaria DICOL:", resumo["controle_diario"]["status"])
     print("Documentos do baseline reprocessados: 0")
     print(f"JSON: {caminho_resultado_json(data_execucao)}")
     print(f"CSV: {caminho_resultado_csv(data_execucao)}")
@@ -565,8 +746,80 @@ def executar() -> dict[str, Any]:
     return resumo
 
 
+def executar_preflight() -> None:
+    """Diagnostico de processamento, totalmente sem gravacao."""
+    carteira = validar_carteira_sem_sincronizar()
+    controle = carregar_json(CAMINHO_CONTROLE_INCREMENTAL)
+    if not controle.get("baseline_inicializado"):
+        raise RuntimeError("Baseline ANVISA nao inicializado")
+    registros = controle.get("documentos", {})
+    if not isinstance(registros, dict):
+        raise RuntimeError("Controle de documentos invalido")
+    pendentes = selecionar_documentos_pendentes(controle)
+    relatorio = carregar_resultado_existente(hoje_iso())
+    historicos = [x for x in registros.values() if isinstance(x, dict) and x.get("baseline")]
+    print("========== PREFLIGHT ANVISA PROCESSAMENTO SEGURO ==========")
+    print("BASELINE:", controle.get("baseline_em"))
+    print("REGISTROS NO CONTROLE:", len(registros))
+    print("REGISTROS HISTORICOS (baseline=True):", len(historicos))
+    print("NOVO_PENDENTE PARA PROCESSAR:", len(pendentes))
+    print("PROCESSOS NA CARTEIRA (conferidos sem alterar):", carteira["total"])
+    print("PROCESSOS ATIVO_INCREMENTAL:", len(obter_processos_ativos_incrementais()))
+    print("PROCESSOS HISTORICOS PENDENTES:", len(obter_processos_historicos_pendentes()))
+    processos_planilha = tuple(carregar_processos_atuais())
+    print("PROCESSOS ELEGIVEIS PROXIMOS PDFS:", len(processos_planilha))
+    # Conferencia diagnostica de diarios anteriores. NAO reprocessa PDFs.
+    faltas = {}
+    completos_verificaveis = 0
+    for chave, registro in registros.items():
+        if not isinstance(registro, dict):
+            continue
+        if registro.get("status") != STATUS_PROCESSADO_INCREMENTAL:
+            continue
+        journal = registro.get("resultado_journal")
+        if not journal:
+            continue
+        caminho = Path(journal)
+        if not caminho.is_file():
+            raise RuntimeError("Diario declarado, mas ausente: " + str(caminho))
+        arquivo = carregar_json(caminho)
+        if arquivo.get("chave_documento") != chave:
+            raise RuntimeError("Diario com chave divergente: " + str(chave))
+        pesquisados = arquivo.get("processos_pesquisados")
+        if not isinstance(pesquisados, list):
+            raise RuntimeError("Diario sem processos_pesquisados: " + str(chave))
+        ausentes = sorted(set(processos_planilha) - set(pesquisados))
+        if ausentes:
+            faltas[chave] = ausentes
+        else:
+            completos_verificaveis += 1
+    print("DOCUMENTOS COM DIARIO E COBERTURA DE 36:", completos_verificaveis)
+    print("DOCUMENTOS COM DIARIO SEM COBERTURA DE TODOS:", len(faltas))
+    print("PROCESSOS AINDA AUSENTES DESSES DIARIOS:",
+          len(set(x for grupo in faltas.values() for x in grupo)))
+    print("NOTA: esta etapa NAO refaz PDFs anteriores e NAO conclui historicos.")
+    print("RESULTADOS JA GUARDADOS HOJE:", len(relatorio["resultados"]))
+    print("STATUS: SOMENTE LEITURA; nenhum PDF ou controle alterado")
+    print("===========================================================")
+
+
 def main() -> None:
-    executar()
+    if sys.argv[1:]:
+        if sys.argv[1:] == ["--preflight"]:
+            executar_preflight()
+        elif sys.argv[1:] == ["--conciliar-diario"]:
+            validar_carteira_sem_sincronizar()
+            processos = tuple(carregar_processos_atuais())
+            controle = carregar_json(CAMINHO_CONTROLE_INCREMENTAL)
+            resumo = conciliar_dicol_diaria(
+                data=hoje_iso(), processos=processos, controle=controle
+            )
+            print("CONCILIACAO DIARIA DICOL:", resumo)
+            print("SEM REPROCESSAMENTO DE PDFs / SEM INTERNET / SEM OCR")
+        else:
+            raise SystemExit("Opcao nao reconhecida; use --preflight ou --conciliar-diario")
+    else:
+        executar()
 
 
 if __name__ == "__main__":

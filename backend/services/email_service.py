@@ -325,6 +325,28 @@ def enviar_email(
 
     lista_destinatarios = _normalizar_destinatarios(destinatarios)
 
+    # Protecao adicional para envio real no ambiente DEV.
+    # A identificacao usa o caminho fisico, nao DOU_ENV.
+    raiz_projeto = Path(__file__).resolve().parents[2]
+
+    if raiz_projeto.name.upper() == "DOU_DIARIO_DEV" and not modo:
+        autorizado = os.getenv("DOU_DEV_EMAIL_AUTORIZADO", "").strip().lower()
+
+        if not autorizado:
+            raise RuntimeError(
+                "Envio real bloqueado no DEV: "
+                "DOU_DEV_EMAIL_AUTORIZADO nao configurado."
+            )
+
+        if (
+            len(lista_destinatarios) != 1
+            or lista_destinatarios[0].strip().lower() != autorizado
+        ):
+            raise RuntimeError(
+                "Envio real bloqueado no DEV: "
+                "destinatario diferente do endereco autorizado."
+            )
+
     config = validar_configuracao_email(
         modo_simulacao=modo,
         destinatarios=destinatarios,

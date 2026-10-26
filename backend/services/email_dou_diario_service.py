@@ -52,7 +52,7 @@ except Exception:
 
 FINALIDADE = "dou_diario"
 
-ENVIAR_EMAIL_SEM_PUBLICACOES = False
+ENVIAR_EMAIL_SEM_PUBLICACOES = True
 
 ASSUNTO_PREFIXO = "DOU Diário"
 
@@ -1882,25 +1882,7 @@ def montar_corpo_email_dou_diario(
             font-size: 13px;
             line-height: 1.55;
         ">
-          <strong>Aviso sobre o processo de monitoramento</strong><br><br>
-
-          Prezados, Este e-mail foi gerado por um
-          <strong>processo automatizado de monitoramento do Diário Oficial da União (DOU)</strong>.
-          <br><br>
-
-          O sistema realiza a leitura diária das publicações oficiais e identifica conteúdos
-          relevantes com base em <strong>palavras-chave previamente definidas</strong>.
-          <br><br>
-
-          Ressaltamos que este processo encontra-se em
-          <strong>fase de validação e aprimoramento</strong>, podendo sofrer ajustes nas
-          regras de busca, palavras-chave, critérios de exclusão e no formato de apresentação
-          das informações.
-          <br><br>
-
-          Caso seja identificada qualquer necessidade de correção, ajuste ou melhoria,
-          a solicitação deverá ser encaminhada para a <strong>área de projetos</strong>,
-          responsável pela análise e evolução do processo.
+          <strong>Status do monitoramento</strong><br><br>
         </div>
 
         <h3 style="margin-top:26px;">PROCESSOS MONITORADOS (PRIORIDADE)</h3>
@@ -1959,10 +1941,45 @@ def montar_corpo_texto_fallback(
 # FUNÇÃO PRINCIPAL
 # ============================================================
 
+
+
+def inserir_motivo_ausencia_no_modelo_html(corpo_html: str, motivos_ausencia=None) -> str:
+    """Acrescenta o motivo apenas quando NAO existem publicacoes.
+
+    Mantem aviso, titulos, tabelas e ordem identicos ao modelo habitual.
+    Uma ausencia de correspondencias NAO comprova, sozinha, pesquisa completa.
+    """
+    if isinstance(motivos_ausencia, str):
+        entradas = [motivos_ausencia]
+    elif isinstance(motivos_ausencia, (list, tuple)):
+        entradas = list(motivos_ausencia)
+    else:
+        entradas = []
+
+    motivos = [normalizar_texto(v)[:700] for v in entradas
+               if isinstance(v, str) and normalizar_texto(v)]
+    motivos = motivos[:10]
+    if not motivos:
+        motivos = [
+            "Nenhuma publicacao relevante consta nos resultados recebidos para esta data. "
+            "A cobertura das fontes deve ser conferida no controle diario e no relatorio."
+        ]
+    observacao = (
+        '<p style="margin:14px 0 0 0; font-size:13px;">'
+        '<strong>Motivo da ausencia de informacoes:</strong><br>'
+        + '<br>'.join(html.escape(item) for item in motivos)
+        + '</p>'
+    )
+    marcador = '        </div>\n\n        <h3 style="margin-top:26px;">PROCESSOS MONITORADOS (PRIORIDADE)</h3>'
+    if corpo_html.count(marcador) != 1:
+        raise RuntimeError('Marcador do modelo de e-mail alterado; nao substituir formato')
+    return corpo_html.replace(marcador, '          ' + observacao + '\n' + marcador, 1)
+
 def enviar_email_dou_diario(
     data_execucao: datetime.date,
     modo_simulacao: bool | None = None,
     destinatarios=None,
+    motivos_ausencia=None,
 ) -> dict:
     """
     Prepara e envia/simula o e-mail diário da finalidade dou_diario.
@@ -2033,10 +2050,30 @@ def enviar_email_dou_diario(
         publicacoes=publicacoes,
     )
 
+    if not publicacoes:
+        corpo_html = inserir_motivo_ausencia_no_modelo_html(
+            corpo_html, motivos_ausencia=motivos_ausencia,
+        )
+
     corpo_texto = montar_corpo_texto_fallback(
         data_execucao=data_execucao,
         quantidade_publicacoes=len(publicacoes),
     )
+
+    if not publicacoes:
+        if isinstance(motivos_ausencia, str):
+            causas = [motivos_ausencia]
+        elif isinstance(motivos_ausencia, (list, tuple)):
+            causas = [s for s in motivos_ausencia if isinstance(s, str)]
+        else:
+            causas = []
+        causas = [normalizar_texto(s)[:700] for s in causas if normalizar_texto(s)][:10]
+        if not causas:
+            causas = [
+                "Nenhuma publicacao relevante consta nos resultados recebidos para esta data. "
+                "A cobertura das fontes deve ser conferida no controle diario e no relatorio."
+            ]
+        corpo_texto += "\n\nMotivo da ausencia de informacoes:\n" + "\n".join(causas)
 
     resultado_envio = enviar_email(
         assunto=assunto,

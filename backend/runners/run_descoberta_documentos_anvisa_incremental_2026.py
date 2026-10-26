@@ -113,7 +113,18 @@ def descobrir_documentos_remotos() -> tuple[list[dict], list[dict]]:
                     nome_fonte=nome_fonte,
                     url_raiz=url_raiz,
                 )
-                documentos.extend(encontrados)
+                if not encontrados:
+                    erros.append({
+                        "fonte": nome_fonte,
+                        "url_raiz": url_raiz,
+                        "etapa": "FONTE_SEM_DOCUMENTOS",
+                        "erro": (
+                            "Fonte retornou zero documentos. "
+                            "Cobertura desta fonte não confirmada."
+                        ),
+                    })
+                else:
+                    documentos.extend(encontrados)
             except Exception as erro:
                 erros.append({
                     "fonte": nome_fonte,
@@ -181,6 +192,14 @@ def executar() -> dict[str, Any]:
 
     try:
         documentos_remotos, erros = descobrir_documentos_remotos()
+        # PATCH_ANVISA_ZERO_DOCUMENTOS_V1 — zero documentos nao e sucesso.
+        if not documentos_remotos:
+            raise RuntimeError(
+                "Descoberta ANVISA encontrou ZERO documentos nas fontes "
+                f"configuradas (erros por fonte: {len(erros)}). "
+                "Controle e baseline preservados; verificar extracao/HTTP."
+            )
+
     except Exception as erro:
         resultado_erro = {
             "status": "ERRO",

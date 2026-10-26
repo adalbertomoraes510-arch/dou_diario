@@ -785,8 +785,9 @@ def carregar_publicacoes_dos_zips(data_alvo: datetime.date) -> list[dict[str, An
 
     for zip_path in zips:
         if not zipfile.is_zipfile(zip_path):
-            print(f"[INLABS] Ignorando ZIP inválido: {zip_path}")
-            continue
+            raise RuntimeError(
+                f"INLABS_ZIP_INVALIDO: {zip_path}"
+            )
 
         secao = zip_path.stem.split("-")[-1]
         print(f"[INLABS] Lendo XMLs de {zip_path.name}...")
@@ -820,6 +821,11 @@ def carregar_publicacoes_dos_zips(data_alvo: datetime.date) -> list[dict[str, An
                 )
 
                 if item is not None:
+                    if item.get("erro_parse_xml"):
+                        raise RuntimeError(
+                            f"INLABS_XML_INVALIDO: {zip_path.name}/{nome_xml}: "
+                            f"{str(item['erro_parse_xml'])[:300]}"
+                        )
                     publicacoes.append(item)
 
                     if item.get("eh_continuacao_inlabs"):
@@ -849,7 +855,51 @@ async def realizar_busca_dou(page, data_alvo: datetime.date) -> dict:
 
     resumo = baixar_zips_inlabs(data_alvo)
     total_xml = int(resumo.get("total_xml") or 0)
+    resultados_secoes = resumo.get("resultados") or []
 
+    erros_graves = [
+        item for item in resultados_secoes
+        if (
+            item.get("http_status") not in (200, 404)
+            or (
+                item.get("http_status") == 200
+                and bool(item.get("erro"))
+            )
+        )
+    ]
+
+    secoes_regulares_ausentes = [
+        str(item.get("secao") or "desconhecida")
+        for item in resultados_secoes
+        if item.get("secao") in ("DO1", "DO2", "DO3")
+        and item.get("http_status") == 404
+    ]
+
+    if secoes_regulares_ausentes:
+        raise RuntimeError(
+            "INLABS_COBERTURA_REGULAR_INCOMPLETA: HTTP 404 nas secoes "
+            + ", ".join(secoes_regulares_ausentes)
+        )
+
+    if erros_graves:
+        secoes = ", ".join(
+            str(item.get("secao") or "desconhecida")
+            for item in erros_graves
+        )
+        raise RuntimeError(
+            "INLABS_COLETA_INCOMPLETA: falha nas secoes "
+            + secoes
+        )
+
+
+    if resultados_secoes and all(
+        item.get("http_status") == 404
+        for item in resultados_secoes
+    ):
+        raise RuntimeError(
+            "INLABS_COBERTURA_NAO_CONFIRMADA: "
+            "todas as secoes retornaram HTTP 404."
+        )
     if total_xml <= 0:
         return {
             "status_busca": "SEM_PUBLICACOES",

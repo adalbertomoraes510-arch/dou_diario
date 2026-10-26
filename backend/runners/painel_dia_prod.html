@@ -1,0 +1,363 @@
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DOU + DICOL — Monitoramento diário PROD</title>
+<style>
+:root{font-family:system-ui,-apple-system,Arial,sans-serif;color:#202b37;background:#f3f6fa}*{box-sizing:border-box}
+main{max-width:1400px;margin:18px auto;padding:0 12px}h1{font-size:26px;margin-bottom:6px}p{line-height:1.55}.muted{color:#596877}.panel{border:1px solid #dce4ee;background:white;border-radius:12px;padding:18px;margin:14px 0;box-shadow:0 2px 12px #263a4a0b}label{font-weight:600;display:block;margin-bottom:8px}input{padding:10px 12px;border:1px solid #aebccd;border-radius:6px;font:inherit}button{cursor:pointer;border:0;border-radius:8px;padding:12px 18px;font-weight:650;background:#17446e;color:#fff;margin:8px 12px 4px 0}button.secondary{background:#48566b}button:disabled{opacity:.5;cursor:default}pre{font:12px/1.55 ui-monospace,Consolas,monospace;color:#d7f3e7;background:#162532;padding:20px;border-radius:8px;overflow:auto;max-height:62vh;white-space:pre-wrap;overflow-wrap:anywhere}.warning{border-left:4px solid #bf7b10;padding:9px 13px;background:#fff9e8}.status{font-weight:700}
+</style>
+<style>
+.hist-ok{color:#17623c;font-weight:650}
+.hist-alerta{color:#996000;font-weight:650}
+.hist-erro{color:#a52727;font-weight:650}
+.historico-dia summary{line-height:1.6}
+</style>
+
+<style>
+.hist-erro-detalhe{
+  color:#596877;
+  font-weight:400;
+}
+</style>
+
+<style>
+@keyframes girarExecucao { to { transform:rotate(360deg); } }
+#indicadorProcessamento {
+  display:none;
+  margin:14px 0;
+  padding:12px 15px;
+  border-radius:8px;
+  background:#fff5d9;
+  border:1px solid #e5bb58;
+  color:#805200;
+  font-weight:700;
+}
+#indicadorProcessamento.ativo {
+  display:flex;
+  align-items:center;
+  gap:12px;
+}
+#indicadorProcessamento.ativo::before {
+  content:"";
+  width:18px;
+  height:18px;
+  border:3px solid #e4c987;
+  border-top-color:#805200;
+  border-radius:50%;
+  animation:girarExecucao .8s linear infinite;
+}
+#dia:disabled, #btnRun:disabled { cursor:not-allowed; opacity:.55; }
+</style>
+
+<style>
+#detalhesExecucao {
+  margin-top:16px;
+}
+#detalhesExecucao summary {
+  cursor:pointer;
+  font-weight:650;
+  color:#17446e;
+  padding:12px 14px;
+  border:1px solid #dce4ee;
+  border-radius:8px;
+  background:#f3f6fa;
+}
+#detalhesExecucao[open] summary {
+  border-radius:8px 8px 0 0;
+}
+#detalhesExecucao pre {
+  margin-top:8px;
+}
+</style>
+</head><body><main>
+<h1>Monitoramento Di&aacute;rio &mdash; DOU + DICOL</h1><p class="muted">Processamento isolado por data. Mesmo executor do terminal, sem revisão histórica. Ambiente de produção; execuções reais exigem confirmação.</p>
+<div class="panel"><label for="dia">Data a processar</label><input type="date" id="dia"  min="2026-01-01" max="2026-12-31"><div><button id="btnRun">Executar monitoramento di&aacute;rio</button>
+<button id="btnReenviar" class="secondary" disabled>
+  Reenviar relat&oacute;rio
+</button></div>
+<div id="situacaoRelatorio"
+     role="status"
+     aria-live="polite"
+     style="margin-top:12px;font-weight:600">
+  Consultando situa&ccedil;&atilde;o do relat&oacute;rio...
+</div></div>
+<div id="indicadorProcessamento" role="status" aria-live="polite">PROCESSAMENTO EM ANDAMENTO &mdash; aguarde a conclus&atilde;o.</div><div class="panel"><div>Status: <span id="status" class="status">Sem execução</span></div><p class="muted">A tela mostra a saída real da rotina. Se uma fonte falhar, o relatório deverá indicar a pendência; não será tratada como ausência de publicações.</p><details id="detalhesExecucao"><summary>Ver detalhes da execu&ccedil;&atilde;o</summary><pre id="saida">Nenhum processo iniciado.</pre></details></div>
+
+<style>
+.historico-mes,.historico-dia{
+  border:1px solid #dce4ee;border-radius:8px;
+  margin:8px 0;background:#fff;overflow:hidden
+}
+.historico-mes summary,.historico-dia summary{
+  padding:13px 15px;cursor:pointer;font-weight:650
+}
+.historico-dia{margin:8px 12px}
+.historico-dia summary{font-weight:500}
+.historico-detalhes{padding:8px 14px 15px}
+.historico-linha{
+  display:grid;grid-template-columns:minmax(160px,1fr) minmax(140px,1fr);
+  gap:10px;padding:9px 0;border-bottom:1px solid #e8edf3;
+  font-size:14px
+}
+.historico-linha:last-child{border-bottom:0}
+.historico-status{overflow-wrap:anywhere}
+.historico-vazio{color:#596877;padding:12px}
+@media(max-width:520px){
+  .historico-linha{grid-template-columns:1fr;gap:3px}
+}
+</style>
+
+<section class="panel">
+  <h2>Historico de execucoes</h2>
+  <p class="muted">
+    Meses e dias pesquisados no DEV. Clique para expandir os detalhes.
+    Registros de teste nao representam execucoes de producao.
+  </p>
+  <div id="historico">Carregando historico...</div>
+</section>
+<script>
+const dia=document.querySelector('#dia'), statusEl=document.querySelector('#status'), saida=document.querySelector('#saida');
+const botoes=[document.querySelector('#btnRun')];
+async function atualizar(){try{const r=await fetch('/api/status',{cache:'no-store'});const j=await r.json();statusEl.textContent=j.status+(j.data?' — '+j.data:'');saida.textContent=j.saida||'Sem saída ainda';saida.scrollTop=saida.scrollHeight;const ocup=j.status==='EM_EXECUCAO';
+botoes.forEach(b=>b.disabled=ocup);
+dia.disabled=ocup;
+document.querySelector('#indicadorProcessamento').classList.toggle('ativo',ocup)}catch(e){statusEl.textContent='Falha na comunicação com o painel'}}
+async function executar(modo){if(modo==='executar'&&!confirm('Executar a pesquisa real para '+dia.value+' e enviar o e-mail aos destinatários configurados no PROD?'))return;
+ botoes.forEach(b=>b.disabled=true);
+dia.disabled=true;
+document.querySelector('#indicadorProcessamento').classList.add('ativo');
+statusEl.textContent='PROCESSAMENTO EM ANDAMENTO';
+try{const r=await fetch('/api/executar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:dia.value,modo})});const j=await r.json();if(!r.ok){alert(j.erro||'Erro ao iniciar');await atualizar();return;}await atualizar();}catch(e){alert('Falha: '+e);await atualizar();}}
+botoes[0].onclick=()=>executar('executar');atualizar();setInterval(atualizar,2500);
+
+const historicoEl=document.querySelector('#historico');
+const escapar=s=>String(s??'').replace(/[&<>"']/g,c=>({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+}[c]));
+const dataLocal=()=>{
+  const d=new Date();
+  const a=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0');
+  const dia=String(d.getDate()).padStart(2,'0');
+  return `${a}-${m}-${dia}`;
+};
+dia.value=dataLocal();
+dia.max=dataLocal();
+
+
+function formatarMes(valor){
+  const [ano,mes]=String(valor).split('-').map(Number);
+  if(!ano || !mes || mes<1 || mes>12)return valor;
+  const data=new Date(ano,mes-1,1);
+  const texto=data.toLocaleDateString('pt-BR',{month:'long',year:'numeric'});
+  return texto.charAt(0).toUpperCase()+texto.slice(1);
+}
+function formatarDia(valor){
+  const partes=String(valor).split('-');
+  return partes.length===3
+    ? partes[2]+'/'+partes[1]+'/'+partes[0] : valor;
+}
+function formatarStatus(valor){
+  const mapa={
+    'PESQUISADO':'Pesquisado',
+    'PESQUISADO_SEM_PUBLICACAO':'Pesquisado, sem publicacoes',
+    'NAO_FOI_POSSIVEL_PESQUISAR':'Nao pesquisado',
+    'NAO_CONFIRMADO':'Nao confirmado',
+    'SEM_CONFIRMACAO':'Sem confirmacao',
+    'GERACAO_NAO_CONFIRMADA':'Geracao nao confirmada',
+    'RESUMO_REGISTRADO':'Relatorio registrado',
+    'GERADO':'Relatório gerado',
+    'INTEGRAL':'Integral',
+    'PARCIAL':'Parcial',
+    'NAO_CONFIRMADA':'Nao confirmada',
+    'PENDENTE_OU_FALHA':'Pendente ou falha',
+    'SEM_REGISTRO':'Sem registro',
+    'ENVIADO':'Enviado',
+    'FALHA_ENVIO':'Falha no envio',
+    'ENVIO_INDETERMINADO':'Envio indeterminado',
+    'BLOQUEADO_SEM_DESTINATARIO_AUTORIZADO':'Envio bloqueado'
+  };
+  return mapa[valor]||String(valor||'Sem registro').replaceAll('_',' ');
+}
+function classeStatus(valor){
+  const s=String(valor||'');
+  if(['INTEGRAL','PESQUISADO','ENVIADO','RESUMO_REGISTRADO','GERADO'].includes(s))
+    return 'hist-ok';
+  if(['PARCIAL','NAO_CONFIRMADA','NAO_CONFIRMADO',
+      'SEM_CONFIRMACAO','SEM_REGISTRO'].includes(s))
+    return 'hist-alerta';
+  return 'hist-erro';
+}
+
+let assinaturaHistorico='';
+async function atualizarHistorico(){
+  try{
+    const r=await fetch('/api/historico',{cache:'no-store'});
+    if(!r.ok)throw Error('HTTP '+r.status);
+    const j=await r.json();
+    const assinatura=JSON.stringify(j);
+    if(assinatura===assinaturaHistorico)return;
+    assinaturaHistorico=assinatura;
+
+    const abertos=new Set(
+      Array.from(historicoEl.querySelectorAll('details[open]'))
+        .map(e=>e.dataset.chave)
+    );
+
+    const meses=Array.isArray(j.meses)?j.meses:[];
+    if(!meses.length){
+      historicoEl.innerHTML='<p class="historico-vazio">Nenhuma execucao registrada.</p>';
+      return;
+    }
+
+    historicoEl.innerHTML=meses.map(m=>{
+      const mes=String(m.mes||'');
+      const dias=Array.isArray(m.dias)?m.dias:[];
+      return `<details class="historico-mes" data-chave="${escapar(mes)}">
+        <summary>${escapar(formatarMes(mes))} - ${dias.length} dia(s)</summary>
+        ${dias.map(d=>{
+          const chave=String(d.data||'');
+          const atividades=Array.isArray(d.atividades)?d.atividades:[];
+          return `<details class="historico-dia" data-chave="${escapar(chave)}">
+            <summary>${escapar(formatarDia(chave))} - Cobertura: <span class="${classeStatus(d.cobertura)}">${escapar(formatarStatus(d.cobertura))}</span> - E-mail: <span class="${classeStatus(d.email)}">${escapar(formatarStatus(d.email))}</span></summary>
+            <div class="historico-detalhes">
+              ${atividades.map(a=>`<div class="historico-linha">
+                <span>${escapar(a.atividade)}</span>
+                <span class="historico-status">
+                  <span class="${classeStatus(a.status)}">${escapar(formatarStatus(a.status))}</span>
+                  ${a.total!==undefined?` (${escapar(a.concluidos)}/${escapar(a.total)})`:''}
+                  ${a.erro?` <span class="hist-erro-detalhe">- ${escapar(a.erro)}</span>`:''}
+                </span>
+              </div>`).join('')}
+            </div>
+          </details>`;
+        }).join('')}
+      </details>`;
+    }).join('');
+
+    historicoEl.querySelectorAll('details').forEach(e=>{
+      if(abertos.has(e.dataset.chave))e.open=true;
+    });
+  }catch(e){
+    historicoEl.textContent='Falha ao carregar historico: '+e.message;
+  }
+}
+atualizarHistorico();
+setInterval(atualizarHistorico,10000);
+
+</script></main>
+<style>
+#btnReenviar:disabled {
+  opacity:.38;
+  cursor:not-allowed;
+}
+#situacaoRelatorio {
+  padding:11px 14px;
+  background:#f3f6fa;
+  border-radius:8px;
+  color:#49566a;
+}
+</style>
+<script>
+(function(){
+  const data=document.querySelector('#dia');
+  const btnRun=document.querySelector('#btnRun');
+  const btnRe=document.querySelector('#btnReenviar');
+  const aviso=document.querySelector('#situacaoRelatorio');
+
+  let versao=0;
+  let bloqueioLocal=false;
+
+  async function verificar(){
+    const atual=++versao;
+    const diaSelecionado=data.value;
+
+    btnRe.disabled=true;
+
+    try{
+      const [resposta,statusResposta]=await Promise.all([
+        fetch('/api/situacao_relatorio?data='+
+          encodeURIComponent(diaSelecionado),{cache:'no-store'}),
+        fetch('/api/status',{cache:'no-store'})
+      ]);
+
+      const info=await resposta.json();
+      const execucao=await statusResposta.json();
+
+      if(atual!==versao || data.value!==diaSelecionado)return;
+
+      const ocupado=execucao.status==='EM_EXECUCAO';
+
+      data.disabled=ocupado;
+      btnRun.disabled=ocupado;
+
+      if(!resposta.ok){
+        aviso.textContent=info.erro||
+          'Nao foi possivel consultar o relatorio';
+        btnRe.disabled=true;
+        return;
+      }
+
+      aviso.textContent=info.mensagem;
+      aviso.style.color=info.gerado?'#17623c':'#805200';
+
+      btnRe.disabled=ocupado||bloqueioLocal||!info.reenviavel;
+
+    }catch(erro){
+      if(atual!==versao)return;
+      btnRe.disabled=true;
+      aviso.textContent='Falha ao consultar a situacao do relatorio';
+    }
+  }
+
+  btnRe.addEventListener('click',async function(){
+    if(btnRe.disabled || bloqueioLocal)return;
+
+    const diaSelecionado=data.value;
+
+    if(!confirm(
+      'Reenviar o relatorio de '+diaSelecionado+
+      ' aos destinatarios configurados no PROD? '+
+      'As pesquisas nao serao repetidas.'
+    ))return;
+
+    bloqueioLocal=true;
+    data.disabled=true;
+    btnRun.disabled=true;
+    btnRe.disabled=true;
+    aviso.textContent='REENVIO EM ANDAMENTO';
+
+    try{
+      const resposta=await fetch('/api/reenviar',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          data:diaSelecionado,
+          confirmacao:'REENVIAR_RELATORIO'
+        })
+      });
+
+      const info=await resposta.json();
+
+      if(!resposta.ok){
+        alert(info.erro||'Falha ao iniciar reenvio');
+      }else{
+        aviso.textContent=
+          'Reenvio iniciado. Acompanhe o status da execucao.';
+      }
+
+    }catch(erro){
+      alert('Falha na comunicacao: '+erro);
+    }finally{
+      bloqueioLocal=false;
+      await verificar();
+    }
+  });
+
+  data.addEventListener('change',verificar);
+  btnRun.addEventListener('click',()=>{
+    btnRe.disabled=true;
+    aviso.textContent='Iniciando monitoramento...';
+  });
+
+  verificar();
+  setInterval(verificar,2500);
+})();
+</script>
+</body></html>

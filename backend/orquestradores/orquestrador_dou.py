@@ -1142,6 +1142,14 @@ async def executar_pipeline_base_dou(
     print("Fonte oficial: INLABS")
     print("=" * 80)
 
+    from backend.operacao.services.progress_service import registrar_evento
+
+    registrar_evento(
+        "INLABS",
+        "INICIADA",
+        {"data": data_execucao.isoformat()},
+    )
+
     try:
         payload_links = await executar_busca_links(
             data_execucao=data_execucao,
@@ -1216,6 +1224,22 @@ async def executar_pipeline_base_dou(
         raise
 
     finally:
+        status_inlabs = str(status_execucao.get("status") or "").upper()
+        if status_inlabs == "SUCESSO":
+            status_evento = "CONCLUIDA"
+        else:
+            status_evento = "ERRO"
+
+        registrar_evento(
+            "INLABS",
+            status_evento,
+            {
+                "data": data_execucao.isoformat(),
+                "status_origem": status_inlabs,
+                "total_registros": len(registros),
+            },
+        )
+
         status_execucao["fim"] = agora_iso()
 
         caminho_status = salvar_status_execucao(

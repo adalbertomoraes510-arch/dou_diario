@@ -3,7 +3,7 @@
 Runner isolado — pesquisa incremental diária de processos no DOU — 2026.
 
 Objetivo desta etapa:
-- usar somente processos com status ATIVO_INCREMENTAL;
+- pesquisar todos os processos da planilha, inclusive com historico pendente;
 - pesquisar somente a base DOU da data informada;
 - não baixar novamente o DOU;
 - não acessar a Anvisa;
@@ -26,11 +26,16 @@ from typing import Any
 
 from backend.services.controle_monitoramento_processos_service import (
     obter_processos_ativos_incrementais,
+    obter_processos_historicos_pendentes,
+    carregar_processos_atuais,
     registrar_execucao_incremental,
     sincronizar_com_planilha,
 )
 from backend.services.pesquisa_processos_dou_service import (
     pesquisar_processos_nos_registros,
+)
+from backend.services.conciliacao_dou_diaria_service import (
+    registrar_pesquisa_diaria_dou_comprovada,
 )
 from backend.runners.run_revisao_historica_processos_pendentes_2026 import (
     garantir_cobertura_dou_para_revisao,
@@ -454,23 +459,30 @@ def executar(data_execucao: dt.date) -> dict:
 
     sincronizacao = sincronizar_com_planilha()
 
-    pendentes = int(
-        sincronizacao.get("historicos_pendentes") or 0
+    # Historico incompleto NAO bloqueia pesquisa das novas publicacoes.
+    # A promocao dos processos pendentes permanece sob controle historico.
+    ativos_incrementais = tuple(obter_processos_ativos_incrementais())
+    historicos_pendentes = tuple(obter_processos_historicos_pendentes())
+    processos = tuple(dict.fromkeys(
+        (*ativos_incrementais, *historicos_pendentes)
+    ))
+    universo_planilha = tuple(carregar_processos_atuais())
+    if (
+        not processos
+        or len(processos) != len(set(processos))
+        or set(processos) != set(universo_planilha)
+        or len(processos) != len(universo_planilha)
+    ):
+        raise RuntimeError(
+            "Divergencia entre planilha e carteira. Pesquisa diaria nao "
+            "pode excluir processos nem marcar cobertura parcial como total."
+        )
+    print(
+        "Monitoramento DOU diario: "
+        f"{len(processos)} processos; "
+        f"{len(historicos_pendentes)} com historico pendente "
+        "(incluidos na pesquisa do dia)."
     )
-
-    if pendentes > 0:
-        raise RuntimeError(
-            "Existem processos com revisao historica pendente. "
-            "Execute primeiro o runner de sincronizacao historica. "
-            f"Pendentes: {pendentes}"
-        )
-
-    processos = tuple(obter_processos_ativos_incrementais())
-
-    if not processos:
-        raise RuntimeError(
-            "Nenhum processo ativo incremental foi encontrado."
-        )
 
     caminho_base = caminho_base_dou(data_execucao)
     payload_base = carregar_json(caminho_base)
@@ -499,12 +511,12 @@ def executar(data_execucao: dt.date) -> dict:
 
     resultados_catchup, resumo_catchup = (
         executar_catchup_ativos_se_necessario(
-            processos=processos,
+            processos=ativos_incrementais,
             data_execucao=data_execucao,
         )
     )
 
-    print(f"Processos ativos: {len(processos)}")
+    print(f"Processos pesquisados na data: {len(processos)}")
     print(f"Registros na base diaria: {len(registros)}")
     print(
         "Processos com catch-up: "
@@ -533,7 +545,7 @@ def executar(data_execucao: dt.date) -> dict:
     # 1. catch-up sem erro;
     # 2. pesquisa da data corrente sem erro.
     controle_atualizado = registrar_execucao_incremental(
-        processos=processos,
+        processos=ativos_incrementais,
         data_dou_processada=data_execucao.isoformat(),
         processos_catchup_validados=(
             processos_catchup_validados
@@ -549,6 +561,18 @@ def executar(data_execucao: dt.date) -> dict:
         controle_atualizado=controle_atualizado,
         resumo_catchup=resumo_catchup,
     )
+
+    # Somente fatos pesquisados na DATA CORRENTE; jamais usar resultados
+    # do catch-up como comprovacao de pesquisa de hoje.
+    controle_diario = registrar_pesquisa_diaria_dou_comprovada(
+        data=data_execucao.isoformat(),
+        processos=processos,
+        resultados_dia=resultados_dia,
+        registros_base=registros,
+        caminho_base=caminho_base,
+        payload_base=payload_base,
+    )
+    resumo["controle_diario_por_fonte"] = controle_diario
 
     print("=" * 80)
     print("PESQUISA INCREMENTAL DIARIA CONCLUIDA")
@@ -572,6 +596,7 @@ def executar(data_execucao: dt.date) -> dict:
         f"{len(processos_catchup_validados)}"
     )
     print(f"Resultados encontrados: {resumo['total_resultados']}")
+    print(f"Controle diario DOU: {controle_diario['status']}")
     print(
         "INLABS no catch-up: somente quando existir "
         "lacuna de cobertura."
@@ -599,12 +624,34 @@ def montar_parser() -> argparse.ArgumentParser:
         help="Data no formato AAAA-MM-DD. Padrão: hoje.",
     )
 
+    parser.add_argument(
+        "--preflight", action="store_true",
+        help="Conferir selecao de processos sem modificar dados ou pesquisar.",
+    )
+
     return parser
 
 
 def main() -> None:
     parser = montar_parser()
     args = parser.parse_args()
+    if args.preflight:
+        ativos = tuple(obter_processos_ativos_incrementais())
+        pendentes = tuple(obter_processos_historicos_pendentes())
+        planilha = tuple(carregar_processos_atuais())
+        escolhidos = tuple(dict.fromkeys((*ativos, *pendentes)))
+        print("=== PREFLIGHT DOU DIARIO - SOMENTE LEITURA ===")
+        print("PROCESSOS NA PLANILHA:", len(planilha))
+        print("ATIVOS_INCREMENTAIS:", len(ativos))
+        print("HISTORICOS_PENDENTES:", len(pendentes))
+        print("ELEGIVEIS_PESQUISA_DIARIA:", len(escolhidos))
+        print("CONVERGENCIA:", (
+            "OK" if set(escolhidos) == set(planilha)
+            and len(escolhidos) == len(planilha) else "DIVERGENTE"
+        ))
+        print("BASE_DOU_NA_DATA:", caminho_base_dou(args.data).exists())
+        print("STATUS: LEITURA; nenhum download ou arquivo alterado")
+        return
     executar(args.data)
 
 

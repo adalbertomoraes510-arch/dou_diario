@@ -936,6 +936,7 @@ def executar(
         resultados_anvisa, resumo_anvisa = (
             runner_anual.pesquisar_processos_anvisa_dicol(
                 forcar_download=False,
+                incluir_baseline_historico=True,
             )
         )
     except Exception as erro:

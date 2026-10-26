@@ -1,4 +1,4 @@
-﻿# ============================================================
+# ============================================================
 # RUNNER â€” Orquestrador DOU por PerÃ­odo
 # Etapa 3.6: data atual por padrÃ£o, perÃ­odo manual opcional,
 # ignora fins de semana, identifica dias/finalidades jÃ¡ gerados,
@@ -14,6 +14,7 @@ import json
 import traceback
 from pathlib import Path
 
+from backend.operacao.services.progress_service import registrar_evento
 from backend.orquestradores.orquestrador_dou import (
     executar_pipeline_dou_multifinalidade,
 )
@@ -61,6 +62,14 @@ FINALIDADES_CONFIG = [
     "informativos",
 ]
 
+# Seletor opcional da finalidade para o painel gerencial.
+import os
+_finalidade = os.getenv("DOU_FINALIDADE", "").strip().lower()
+if _finalidade:
+    if _finalidade not in FINALIDADES_CONFIG:
+        raise ValueError(f"Finalidade DOU invalida: {_finalidade}")
+    FINALIDADES_CONFIG = [_finalidade]
+
 LIMITE_DIAS_PERIODO = 31
 
 # True = apenas lista o que seria processado
@@ -102,7 +111,7 @@ ENVIAR_EMAIL_DOU_DIARIO = True
 # None = respeita EMAIL_MODO_SIMULACAO do email_service.py.
 # True = forÃ§a simulaÃ§Ã£o do e-mail.
 # False = permite envio real, desde que EMAIL_USER/EMAIL_PASS estejam configurados.
-EMAIL_DOU_DIARIO_MODO_SIMULACAO = False
+EMAIL_DOU_DIARIO_MODO_SIMULACAO = os.getenv("EMAIL_DOU_DIARIO_MODO_SIMULACAO", "true").strip().lower() not in {"false", "0", "nao", "não", "no"}
 
 # False = se o pipeline rodar com sucesso, mas o e-mail falhar,
 # registra o erro do e-mail no status tÃ©cnico e continua o perÃ­odo.
@@ -944,9 +953,16 @@ def tentar_enviar_email_dou_diario_item(
     print("=" * 80)
 
     try:
+        destinatario_teste = os.getenv("DOU_DEV_EMAIL_AUTORIZADO", "").strip()
+
         resultado_email = enviar_email_dou_diario(
             data_execucao=data_execucao,
             modo_simulacao=EMAIL_DOU_DIARIO_MODO_SIMULACAO,
+            destinatarios=(
+                [destinatario_teste]
+                if destinatario_teste
+                else None
+            ),
         )
 
         chaves_incluidas = [
@@ -1479,6 +1495,82 @@ async def executar_itens_planejados(planejamento: dict) -> list[dict]:
                 })
 
         except Exception as erro:
+            # Contingencia V7: somente falha identificada da fonte INLABS.
+            contingencia_v7 = None
+            mensagem_erro = str(erro)
+            falha_fonte_inlabs = (
+                "INLABS_COLETA_INCOMPLETA" in mensagem_erro
+                or "INLABS_COBERTURA_NAO_CONFIRMADA" in mensagem_erro
+                or "Falha ao obter cookie INLABS" in mensagem_erro
+            )
+
+            if (
+                falha_fonte_inlabs
+                and "dou_diario" in finalidades_grupo
+                and os.getenv("DOU_EXECUCAO_ID")
+            ):
+                import sys
+
+                comando_v7 = [
+                    sys.executable,
+                    "-m",
+                    "backend.operacao.services.executor_contingencia_v7",
+                    "--data",
+                    data_execucao.isoformat(),
+                    "--executar",
+                ]
+
+                try:
+                    registrar_evento(
+                        "CONTINGENCIA_V7",
+                        "INICIADA",
+                        {
+                            "data": data_execucao.isoformat(),
+                            "motivo": mensagem_erro,
+                            "tipo_cobertura": "SOMENTE_PROCESSOS",
+                        },
+                    )
+
+                    processo_v7 = await asyncio.create_subprocess_exec(
+                        *comando_v7,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                    )
+
+                    saida_v7, _ = await processo_v7.communicate()
+                    texto_v7 = saida_v7.decode("utf-8", errors="replace")
+
+                    print(texto_v7, flush=True)
+
+                    contingencia_v7 = {
+                        "executada": True,
+                        "codigo_saida": processo_v7.returncode,
+                        "status": (
+                            "CONCLUIDA"
+                            if processo_v7.returncode == 0
+                            else (
+                                "PARCIAL"
+                                if processo_v7.returncode == 2
+                                else "ERRO"
+                            )
+                        ),
+                    }
+
+                except Exception as erro_v7:
+                    contingencia_v7 = {
+                        "executada": False,
+                        "status": "ERRO",
+                        "erro": str(erro_v7),
+                    }
+
+                    registrar_evento(
+                        "CONTINGENCIA_V7",
+                        "ERRO",
+                        {
+                            "data": data_execucao.isoformat(),
+                            "erro": str(erro_v7),
+                        },
+                    )
             traceback_texto = traceback.format_exc()
 
             erro_path = (
@@ -1498,6 +1590,11 @@ async def executar_itens_planejados(planejamento: dict) -> list[dict]:
                     "traceback_path": str(erro_path),
                     "email_dou_diario": None,
                     "monitoramento_processos_dou_incremental": None,
+                    "contingencia_v7": (
+                        contingencia_v7
+                        if item.get("finalidade") == "dou_diario"
+                        else None
+                    ),
                 })
 
             print("=" * 80)
@@ -1782,6 +1879,112 @@ def salvar_status_periodo(
 # EXECUÃ‡ÃƒO PRINCIPAL
 # ============================================================
 
+def comunicar_falhas_dou_diario(resultados, resultado_anvisa):
+    """Comunica falhas sem reutilizar relatórios ou anexos antigos."""
+    from html import escape
+    from backend.services.email_service import enviar_email
+
+    raiz_projeto = Path(__file__).resolve().parents[2]
+    if raiz_projeto.name.upper() != "DOU_DIARIO_DEV":
+        return
+
+    destinatario = os.getenv("DOU_DEV_EMAIL_AUTORIZADO", "").strip()
+
+    for item in resultados:
+        if (
+            item.get("finalidade") != "dou_diario"
+            or item.get("status_execucao") != "ERRO"
+        ):
+            continue
+
+        data = str(item.get("data") or "")
+        erro = str(item.get("erro") or "Erro não informado")
+        contingencia = item.get("contingencia_v7") or {}
+        status_v7 = str(contingencia.get("status") or "NAO_EXECUTADA")
+        status_anvisa = str(
+            (resultado_anvisa or {}).get("status") or "NAO_INFORMADO"
+        )
+
+        if not ENVIAR_EMAIL_DOU_DIARIO:
+            item["email_dou_diario"] = {"status": "DESABILITADO"}
+            continue
+
+        if not destinatario:
+            item["email_dou_diario"] = {
+                "status": "BLOQUEADO_SEM_DESTINATARIO_AUTORIZADO"
+            }
+            registrar_evento(
+                "EMAIL_DOU_DIARIO",
+                "ERRO",
+                {"data": data, "motivo": "Destinatario autorizado ausente"},
+            )
+            continue
+
+        assunto = f"[DOU DEV] Relatorio de falha - {data}"
+
+        corpo_html = (
+            "<h2>Relatório operacional DOU - DEV</h2>"
+            f"<p><b>Data:</b> {escape(data)}</p>"
+            "<p><b>Coleta principal:</b> falha</p>"
+            f"<p><b>Erro:</b> {escape(erro)}</p>"
+            f"<p><b>Contingência V7:</b> {escape(status_v7)}</p>"
+            "<p><b>Cobertura V7:</b> somente processos cadastrados</p>"
+            f"<p><b>Anvisa:</b> {escape(status_anvisa)}</p>"
+            "<p>A cobertura integral do DOU não foi confirmada.</p>"
+            "<p>Nenhum relatório anterior foi anexado.</p>"
+        )
+
+        try:
+            registrar_evento(
+                "EMAIL_DOU_DIARIO",
+                "INICIADA",
+                {"data": data, "tipo": "RELATORIO_DE_FALHA"},
+            )
+
+            resposta = enviar_email(
+                assunto=assunto,
+                corpo_html=corpo_html,
+                corpo_texto=(
+                    f"DOU DEV - {data}\n"
+                    f"Coleta principal: FALHA\n"
+                    f"Erro: {erro}\n"
+                    f"V7: {status_v7}\n"
+                    f"Anvisa: {status_anvisa}\n"
+                    "Cobertura integral do DOU nao confirmada."
+                ),
+                destinatarios=[destinatario],
+                modo_simulacao=EMAIL_DOU_DIARIO_MODO_SIMULACAO,
+            )
+
+            item["email_dou_diario"] = resposta
+
+            registrar_evento(
+                "EMAIL_DOU_DIARIO",
+                (
+                    "CONCLUIDA"
+                    if resposta.get("status") == "ENVIADO"
+                    else "PARCIAL"
+                ),
+                {
+                    "data": data,
+                    "tipo": "RELATORIO_DE_FALHA",
+                    "status_origem": resposta.get("status"),
+                },
+            )
+
+        except Exception as erro_email:
+            item["email_dou_diario"] = {
+                "status": "ERRO",
+                "erro": str(erro_email),
+            }
+
+            registrar_evento(
+                "EMAIL_DOU_DIARIO",
+                "ERRO",
+                {"data": data, "erro": str(erro_email)},
+            )
+
+
 async def main() -> None:
     data_inicio, data_fim = resolver_periodo_execucao()
 
@@ -1827,20 +2030,82 @@ async def main() -> None:
     else:
         # Executado uma única vez por chamada do runner.
         # Se houver processo novo, somente ele passa pela revisão histórica.
-        resultado_sincronizacao_processos = (
-            await executar_sincronizacao_processos_incremental_segura(
-                data_referencia=data_inicio,
+        from backend.operacao.services.progress_service import registrar_evento
+
+        registrar_evento("SINCRONIZACAO_PROCESSOS", "INICIADA")
+
+        try:
+            resultado_sincronizacao_processos = (
+                await executar_sincronizacao_processos_incremental_segura(
+                    data_referencia=data_inicio,
+                )
             )
-        )
+        except Exception as erro:
+            registrar_evento(
+                "SINCRONIZACAO_PROCESSOS",
+                "ERRO",
+                {"erro": str(erro)},
+            )
+            raise
+        else:
+            status_sync = str(
+                resultado_sincronizacao_processos.get("status") or ""
+            ).upper()
+
+            if "ERRO" in status_sync or "FALHA" in status_sync:
+                status_evento = "ERRO"
+            elif status_sync in {"DESABILITADO", "NAO_EXECUTADO"}:
+                status_evento = "IGNORADA"
+            else:
+                status_evento = "CONCLUIDA"
+
+            registrar_evento(
+                "SINCRONIZACAO_PROCESSOS",
+                status_evento,
+                {"status_origem": status_sync},
+            )
 
         # A Anvisa é executada antes dos itens diários para que qualquer
         # ocorrência nova já esteja no mesmo e-mail do DOU.
-        resultado_anvisa_incremental = (
-            await executar_anvisa_incremental_segura()
-        )
+        registrar_evento("ANVISA_INCREMENTAL", "INICIADA")
+
+        try:
+            resultado_anvisa_incremental = (
+                await executar_anvisa_incremental_segura()
+            )
+        except Exception as erro:
+            registrar_evento(
+                "ANVISA_INCREMENTAL",
+                "ERRO",
+                {"erro": str(erro)},
+            )
+            raise
+        else:
+            status_anvisa = str(
+                resultado_anvisa_incremental.get("status") or ""
+            ).upper()
+
+            if status_anvisa == "SUCESSO":
+                status_evento = "CONCLUIDA"
+            elif status_anvisa == "CONCLUIDO_COM_PENDENCIAS":
+                status_evento = "PARCIAL"
+            elif status_anvisa == "DESABILITADO":
+                status_evento = "IGNORADA"
+            else:
+                status_evento = "ERRO"
+
+            registrar_evento(
+                "ANVISA_INCREMENTAL",
+                status_evento,
+                {"status_origem": status_anvisa},
+            )
 
         resultados_execucao = await executar_itens_planejados(
             planejamento=planejamento,
+        )
+        comunicar_falhas_dou_diario(
+            resultados_execucao,
+            resultado_anvisa_incremental,
         )
         imprimir_resumo_execucao(resultados_execucao)
 

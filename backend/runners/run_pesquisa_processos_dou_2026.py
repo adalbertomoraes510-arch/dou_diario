@@ -1501,138 +1501,286 @@ def extrair_links_html_anvisa(
     return links
 
 
+# ANVISA_DISCOVERY_V2 — leitura restrita de enderecos embutidos no Plone.
+def _links_json_embutido_anvisa(texto_html: str, url_raiz: str) -> list[dict]:
+    """Recupera URLs dos itens do diretório, inclusive com barras \\u002F.
+
+    O JSON incorporado pode conter PDFs ou páginas individuais das atas.
+    Não executa JavaScript nem segue endereços fora do diretório oficial.
+    """
+    import html as _html
+    import re as _re
+
+    raiz = normalizar_url_anvisa(url_raiz)
+    caminho = urlparse(raiz).path.rstrip("/")
+    if not caminho.startswith("/anvisa/pt-br/"):
+        raise ValueError("Diretório ANVISA inesperado: " + raiz)
+
+    texto = _re.sub(r"\\u002[fF]", "/", texto_html)
+    texto = texto.replace(r"\/", "/")
+    texto = _html.unescape(texto)
+
+    # Os metadados Plone usam tanto URL completa quanto '/pt-br/...'.
+    sem_anvisa = caminho[len("/anvisa"):]
+    prefixos = (
+        _re.escape(caminho),
+        _re.escape(sem_anvisa),
+    )
+    padrao = _re.compile(
+        r"(?:https?://www\.gov\.br)?(?:" + "|".join(prefixos)
+        + r")(?:/[^\s\x22\x27<>\\,}\]]+)?",
+        _re.IGNORECASE,
+    )
+    achados: list[dict] = []
+    vistos: set[str] = set()
+    for match in padrao.finditer(texto):
+        bruto = match.group(0)
+        if bruto.startswith("/pt-br/"):
+            bruto = "https://www.gov.br/anvisa" + bruto
+        elif bruto.startswith("/anvisa/"):
+            bruto = "https://www.gov.br" + bruto
+
+        url = normalizar_url_anvisa(bruto)
+        partes = urlparse(url)
+        if partes.scheme != "https" or partes.netloc != "www.gov.br":
+            continue
+        if not url_no_diretorio_anvisa(url, raiz):
+            continue
+        if partes.query:
+            continue
+        if url == raiz or url in vistos:
+            continue
+        vistos.add(url)
+        achados.append({"url": url, "titulo": unquote(partes.path.rstrip("/").split("/")[-1])})
+    return achados
+
+
+def _eh_endereco_pdf_anvisa(url: str) -> bool:
+    caminho = unquote(urlparse(url).path).lower().rstrip("/")
+    return caminho.endswith(".pdf") or caminho.endswith("/@@download/file")
+
+
+def _extrair_pdfs_json_embutido_anvisa(texto_html: str, url_raiz: str) -> list[dict]:
+    """Interface mantida para diagnóstico e compatibilidade com v001."""
+    return [
+        item for item in _links_json_embutido_anvisa(texto_html, url_raiz)
+        if _eh_endereco_pdf_anvisa(item["url"])
+    ]
+
+
+# ANVISA_DISCOVERY_V3 — aceitar apenas paginas publicas da fonte DICOL.
+def _eh_pagina_publica_dicol_anvisa(
+    url: str, url_raiz: str, nome_fonte: str,
+) -> bool:
+    """Bloqueia acoes do Plone e limita navegacao a atas/pautas de 2026.
+
+    A checagem do PDF e feita ANTES dessa funcao, para nao excluir
+    anexos com nomes genericos (por exemplo, SEI_...pdf).
+    """
+    import re as _re
+
+    parsed = urlparse(url)
+    base = urlparse(url_raiz)
+    if parsed.scheme != "https" or parsed.netloc != "www.gov.br":
+        return False
+    if parsed.query or parsed.fragment:
+        return False
+    base_path = unquote(base.path).rstrip("/")
+    path = unquote(parsed.path).rstrip("/")
+    if not path.startswith(base_path + "/"):
+        return False
+    relativos = path[len(base_path) + 1:].split("/")
+    if not 1 <= len(relativos) <= 3:
+        return False
+
+    for segmento in relativos:
+        slug = segmento.lower()
+        if not _re.fullmatch(r"[a-z0-9][a-z0-9._~-]*", slug):
+            return False
+        if slug.startswith((
+            "object_", "manage_", "portal_", "@@", "@", "++",
+            "acl_", "plone_", "controlpanel", "@@", "rename",
+        )):
+            return False
+        if slug in {
+            "view", "edit", "delete", "copy", "cut", "paste", "login",
+            "login_form", "logout", "search", "index_html", "contents",
+            "folder_contents", "folder_factories", "properties", "history",
+            "metadata", "edit_form", "base_edit", "sitemap", "rss",
+            "robots.txt", "resolveuid", "@@download", "download",
+        }:
+            return False
+        # Endpoints, arquivos estaticos e recursos nao sao paginas-filha.
+        if _re.search(r"\.(?:js|css|xml|json|txt|png|jpe?g|svg|zip|xlsx?|docx?|pdf)$", slug):
+            return False
+
+    primeiro = relativos[0].lower()
+    # A pagina do ano pode conter links administrativos dentro da mesma
+    # pasta. Paginas-filha legitimas tem slugs de atas/reunioes ou pautas.
+    if "_ATAS" in nome_fonte:
+        return "ata" in primeiro or "reuniao" in primeiro
+    if "_PAUTAS" in nome_fonte:
+        return "pauta" in primeiro or "reuniao" in primeiro or "dicol" in primeiro
+    return False
+
+
+# ANVISA_DISCOVERY_V4 — catalogo de File/mime_type; sem falsos negativos por URL sem .pdf.
+def _itens_catalogo_anvisa(texto_html: str, url_raiz: str) -> tuple[list[dict], int]:
+    """Le os metadados da pasta publicados no estado SSR do portal Plone.
+
+    O JS tem literais 'undefined', portanto nao e JSON completo. Extrai
+    somente o ARRAY JSON `items` seguido de `items_total`, usando decoder
+    que respeita strings, escapes e objetos. Nunca executa JavaScript.
+    """
+    import json as _json
+    import re as _re
+
+    raiz = normalizar_url_anvisa(url_raiz)
+    padrao = _re.compile(r'"items"\s*:\s*\[')
+    candidatos: list[tuple[list[dict], int]] = []
+    for ocorrencia in padrao.finditer(texto_html):
+        fatia = texto_html[ocorrencia.end() - 1:]
+        try:
+            itens, consumido = _json.JSONDecoder().raw_decode(fatia)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(itens, list):
+            continue
+        fim = fatia[consumido:]
+        m_total = _re.match(r'\s*,\s*"items_total"\s*:\s*(\d+)', fim)
+        if not m_total:
+            continue
+        total = int(m_total.group(1))
+        if total < 0:
+            continue
+        # Existem tambem estados de navegacao com arrays de itens alheios.
+        # O catalogo do ano so pode conter itens da propria pasta anual.
+        if itens and not all(
+            isinstance(item, dict)
+            and isinstance(item.get("@id"), str)
+            and item["@id"].startswith(raiz + "/")
+            for item in itens
+        ):
+            continue
+        if not itens and total == 0:
+            continue  # descartar listas vazias de outros componentes
+        candidatos.append((itens, total))
+
+    if not candidatos:
+        raise RuntimeError(
+            "ANVISA: lista oficial items/items_total nao encontrada no "
+            f"catalogo {raiz}; nao e seguro certificar descoberta parcial."
+        )
+
+    # O HTML replica o estado em mais de um ponto; exige consistencia.
+    referencia, total = candidatos[0]
+    def identidade_registros(lista: list[dict]) -> list[tuple]:
+        return [
+            (item.get("@id"), item.get("@type"), item.get("mime_type"),
+             item.get("title"), item.get("review_state"))
+            for item in lista
+        ]
+
+    for outros, outro_total in candidatos[1:]:
+        # O estado SSR pode repetir a lista em uma estrutura enriquecida
+        # com campos auxiliares (por exemplo, `url`). Validar identidade.
+        if identidade_registros(outros) != identidade_registros(referencia) or outro_total != total:
+            raise RuntimeError("ANVISA: catalogos SSR divergentes na mesma pagina.")
+    if len(referencia) != total:
+        raise RuntimeError(
+            f"ANVISA: catalogo paginado/incompleto: {len(referencia)} "
+            f"itens exibidos, {total} no total. Descoberta bloqueada "
+            "para evitar omissao; paginacao exige implementacao propria."
+        )
+    return referencia, total
+
+
+def _documentos_catalogo_anvisa(
+    texto_html: str, nome_fonte: str, url_raiz: str,
+) -> list[dict]:
+    """Para cada File application/pdf, reconstitui URL canônica legada.
+
+    Plone usa /@@download/file para File cujo @id nao termina em .pdf.
+    Esse padrao preserva a identidade (SHA-256 da URL) do baseline 2026.
+    """
+    raiz = normalizar_url_anvisa(url_raiz)
+    itens, total = _itens_catalogo_anvisa(texto_html, raiz)
+    documentos: list[dict] = []
+    urls_vistas: set[str] = set()
+    arquivos_pdf = 0
+    for item in itens:
+        if not isinstance(item, dict):
+            raise RuntimeError("ANVISA: item do catalogo nao e objeto JSON.")
+        tipo_item = str(item.get("@type") or "")
+        mime = str(item.get("mime_type") or "").lower().split(";", 1)[0].strip()
+        endereco = str(item.get("@id") or "").strip()
+        if tipo_item != "File":
+            continue
+        if mime != "application/pdf" and not endereco.lower().endswith(".pdf"):
+            continue
+        arquivos_pdf += 1
+        item_url = normalizar_url_anvisa(endereco)
+        parsed = urlparse(item_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != "www.gov.br"
+            or parsed.query or parsed.fragment
+            or not url_no_diretorio_anvisa(item_url, raiz)
+            or item_url == raiz
+        ):
+            raise RuntimeError(f"ANVISA: URL de arquivo PDF insegura: {endereco}")
+        if _eh_endereco_pdf_anvisa(item_url):
+            pdf_url = item_url
+            url_visualizacao = item_url
+        else:
+            pdf_url = item_url + "/@@download/file"
+            url_visualizacao = item_url + "/view"
+        if pdf_url in urls_vistas:
+            raise RuntimeError(f"ANVISA: arquivo duplicado no catalogo: {pdf_url}")
+        urls_vistas.add(pdf_url)
+        titulo = str(item.get("title") or item.get("description") or "").strip()
+        if not titulo:
+            titulo = unquote(parsed.path.split("/")[-1]).replace("-", " ")
+        documentos.append({
+            "fonte": nome_fonte,
+            "titulo": titulo,
+            "url_item": url_visualizacao,
+            "url_pdf": pdf_url,
+        })
+
+    if len(documentos) != arquivos_pdf:
+        raise RuntimeError(
+            "ANVISA: numero de PDFs extraidos difere do catalogo; abortado."
+        )
+    print(
+        f"[ANVISA] {nome_fonte}: {len(documentos)} PDF(s) "
+        f"de {total} item(ns) oficiais; cobertura SSR completa."
+    )
+    documentos.sort(key=lambda d: (d["titulo"], d["url_pdf"]))
+    return documentos
+
+
 def descobrir_pdfs_fonte_anvisa(
     sessao,
     nome_fonte: str,
     url_raiz: str,
 ) -> list[dict]:
+    """Descoberta completa a partir da lista oficial de itens da pasta.
+
+    Nao percorre endpoints administrativos nem baixa PDFs nesta fase.
+    Se o portal paginar ou mudar formato, falha de forma explicita.
+    """
     print("=" * 80)
-    print(
-        f"[ANVISA] DESCOBRINDO DOCUMENTOS — {nome_fonte}"
-    )
+    print(f"[ANVISA] DESCOBRINDO DOCUMENTOS — {nome_fonte}")
     print("=" * 80)
-
-    resposta_raiz = obter_http_com_tentativas(
-        sessao,
-        url_raiz,
-    )
-
-    links_raiz = extrair_links_html_anvisa(
-        resposta_raiz.text,
-        resposta_raiz.url,
-    )
-
-    candidatos = [
-        item
-        for item in links_raiz
-        if url_no_diretorio_anvisa(
-            item["url"],
-            url_raiz,
-        )
-        and normalizar_url_anvisa(
-            item["url"]
-        )
-        != normalizar_url_anvisa(
-            url_raiz
-        )
-    ]
-
-    documentos: list[dict] = []
-    pdfs_vistos: set[str] = set()
-
-    for indice, candidato in enumerate(
-        candidatos,
-        start=1,
-    ):
-        url_candidato = candidato["url"]
-
-        try:
-            resposta = obter_http_com_tentativas(
-                sessao,
-                url_candidato,
-            )
-        except Exception as erro:
-            print(
-                f"[ANVISA] Não foi possível abrir "
-                f"{url_candidato}: {erro}"
-            )
-            continue
-
-        if resposta_eh_pdf(resposta):
-            url_pdf = normalizar_url_anvisa(
-                resposta.url
-            )
-
-            if url_pdf not in pdfs_vistos:
-                pdfs_vistos.add(url_pdf)
-                documentos.append({
-                    "fonte": nome_fonte,
-                    "titulo": (
-                        candidato.get("titulo")
-                        or Path(
-                            urlparse(url_pdf).path
-                        ).name
-                    ),
-                    "url_item": url_candidato,
-                    "url_pdf": url_pdf,
-                })
-
-            continue
-
-        links_item = extrair_links_html_anvisa(
-            resposta.text,
-            resposta.url,
-        )
-
-        for link in links_item:
-            url_link = link["url"]
-            url_lower = unquote(
-                urlparse(url_link).path
-            ).lower()
-
-            parece_pdf = (
-                ".pdf" in url_lower
-                or "@@download/file" in url_lower
-            )
-
-            if not parece_pdf:
-                continue
-
-            url_pdf = normalizar_url_anvisa(
-                url_link
-            )
-
-            if url_pdf in pdfs_vistos:
-                continue
-
-            pdfs_vistos.add(url_pdf)
-            documentos.append({
-                "fonte": nome_fonte,
-                "titulo": (
-                    link.get("titulo")
-                    or candidato.get("titulo")
-                    or Path(
-                        urlparse(url_pdf).path
-                    ).name
-                ),
-                "url_item": url_candidato,
-                "url_pdf": url_pdf,
-            })
-
-    documentos.sort(
-        key=lambda item: (
-            item.get("fonte") or "",
-            item.get("titulo") or "",
-            item.get("url_pdf") or "",
-        )
-    )
-
-    print(
-        f"[ANVISA] {nome_fonte}: "
-        f"{len(documentos)} PDF(s) descoberto(s)."
-    )
-
-    return documentos
+    raiz = normalizar_url_anvisa(url_raiz)
+    resposta = obter_http_com_tentativas(sessao, raiz)
+    tipo = str(resposta.headers.get("Content-Type", "")).lower()
+    if "text/html" not in tipo:
+        raise RuntimeError(f"ANVISA: catalogo nao retornou HTML: {raiz} ({tipo})")
+    if not str(resposta.url).startswith(raiz):
+        raise RuntimeError(f"ANVISA: redirecionamento inesperado: {resposta.url}")
+    return _documentos_catalogo_anvisa(resposta.text, nome_fonte, raiz)
 
 
 def nome_arquivo_pdf_anvisa(
@@ -1739,16 +1887,49 @@ def baixar_pdf_anvisa(
             )
             return caminho
 
+    # ANVISA_DOWNLOAD_V4_2: a URL .pdf pode servir HTML (HTTP 200).
+    # Nessa situacao, tentar o endpoint de binario /@@download/file.
+    # A identidade, o nome local e a URL do documento permanecem originais.
+    url_original = str(documento["url_pdf"])
     resposta = obter_http_com_tentativas(
         sessao,
-        str(documento["url_pdf"]),
-        aceitar_pdf=True,
+        url_original,
+        aceitar_pdf=False,  # Evita retentar respostas HTTP 200 com HTML.
     )
 
-    if not resposta_eh_pdf(resposta):
+    if not resposta.content.startswith(b"%PDF"):
+        url_analisada = urlparse(url_original)
+        tipo = str(resposta.headers.get("Content-Type") or "").lower()
+        origens_validas = tuple(
+            str(raiz).rstrip("/") + "/"
+            for raiz in ANVISA_FONTES.values()
+        )
+        pode_tentar_alternativa = (
+            resposta.status_code == 200
+            and "text/html" in tipo
+            and url_analisada.scheme == "https"
+            and url_analisada.netloc == "www.gov.br"
+            and not url_analisada.query
+            and not url_analisada.fragment
+            and url_analisada.path.lower().endswith(".pdf")
+            and url_original.startswith(origens_validas)
+        )
+        if pode_tentar_alternativa:
+            url_binario = url_original.rstrip("/") + "/@@download/file"
+            print("[ANVISA] URL .pdf retornou HTML; tentando /@@download/file.")
+            resposta = obter_http_com_tentativas(
+                sessao,
+                url_binario,
+                aceitar_pdf=False,
+            )
+
+    # O Content-Type sozinho nao comprova integridade de PDF.
+    if not resposta.content.startswith(b"%PDF"):
+        tipo = str(resposta.headers.get("Content-Type") or "desconhecido")
         raise RuntimeError(
-            "O endereço não retornou um PDF válido: "
-            f"{documento['url_pdf']}"
+            "Download ANVISA sem assinatura PDF (%PDF); manter pendente. "
+            f"URL original: {url_original}; Content-Type: {tipo}; "
+            f"URL final: {resposta.url}"
         )
 
     temporario = caminho.with_suffix(
@@ -2394,9 +2575,37 @@ def salvar_resultados_anvisa(
     return resumo
 
 
+def carregar_pdfs_historicos_anvisa() -> list[dict]:
+    """Acervo do controle incremental, somente leitura; não altera o baseline."""
+    from backend.services.controle_documentos_anvisa_service import (
+        CAMINHO_CONTROLE_INCREMENTAL,
+    )
+    if not CAMINHO_CONTROLE_INCREMENTAL.is_file():
+        raise RuntimeError(
+            "Controle de PDFs históricos da ANVISA não encontrado: "
+            f"{CAMINHO_CONTROLE_INCREMENTAL}"
+        )
+    with CAMINHO_CONTROLE_INCREMENTAL.open("r", encoding="utf-8-sig") as f:
+        payload = json.load(f)
+    registros = payload.get("documentos")
+    if not isinstance(registros, dict) or not registros:
+        raise RuntimeError("Controle histórico ANVISA vazio ou inválido")
+    documentos = []
+    for chave, registro in registros.items():
+        if not isinstance(registro, dict):
+            raise RuntimeError(f"Registro histórico ANVISA inválido: {chave}")
+        doc = dict(registro)
+        if not doc.get("url_pdf") or not doc.get("arquivo_pdf"):
+            raise RuntimeError(f"Registro histórico ANVISA incompleto: {chave}")
+        doc["_caminho_historico_local"] = str(doc["arquivo_pdf"])
+        documentos.append(doc)
+    return documentos
+
+
 def pesquisar_processos_anvisa_dicol(
     *,
     forcar_download: bool,
+    incluir_baseline_historico: bool = False,
 ) -> tuple[list[dict], dict]:
     print("=" * 80)
     print(
@@ -2430,6 +2639,21 @@ def pesquisar_processos_anvisa_dicol(
                     "etapa": (
                         "DESCOBERTA_DOCUMENTOS"
                     ),
+                    "erro": str(erro),
+                })
+
+        # Exclusivamente revisão histórica: processar também PDFs registrados
+        # antes da última descoberta. O fluxo anual comum não muda.
+        if incluir_baseline_historico:
+            try:
+                historicos = carregar_pdfs_historicos_anvisa()
+                # Históricos primeiro: privilegia caminho físico registrado.
+                documentos = historicos + documentos
+                print(f"[ANVISA] Baseline histórico carregado: {len(historicos)} PDF(s).")
+            except Exception as erro:
+                erros.append({
+                    "fonte": "ANVISA_DICOL",
+                    "etapa": "CARREGAR_BASELINE_HISTORICO",
                     "erro": str(erro),
                 })
 
@@ -2467,13 +2691,21 @@ def pesquisar_processos_anvisa_dicol(
             )
 
             try:
-                caminho_pdf = baixar_pdf_anvisa(
-                    sessao=sessao,
-                    documento=documento,
-                    forcar_download=(
-                        forcar_download
-                    ),
-                )
+                caminho_historico = documento.get("_caminho_historico_local")
+                if incluir_baseline_historico and caminho_historico:
+                    caminho_pdf = Path(caminho_historico)
+                    if not caminho_pdf.is_file():
+                        raise FileNotFoundError(f"PDF histórico ausente: {caminho_pdf}")
+                    with caminho_pdf.open("rb") as arquivo_pdf:
+                        if arquivo_pdf.read(4) != b"%PDF":
+                            raise RuntimeError(f"PDF histórico inválido: {caminho_pdf}")
+                    documento["origem_arquivo"] = "BASELINE_LOCAL"
+                else:
+                    caminho_pdf = baixar_pdf_anvisa(
+                        sessao=sessao,
+                        documento=documento,
+                        forcar_download=(forcar_download),
+                    )
 
                 documento["_forcar_ocr"] = (
                     forcar_download
@@ -2491,9 +2723,19 @@ def pesquisar_processos_anvisa_dicol(
                     None,
                 )
 
-                documento["diagnostico_pdf"] = (
-                    diagnostico
-                )
+                documento["diagnostico_pdf"] = diagnostico
+                if incluir_baseline_historico:
+                    status = diagnostico.get("status_leitura")
+                    if (status not in {"TEXTO_EXTRAIDO", "TEXTO_EXTRAIDO_OCR"}
+                            or int(diagnostico.get("erros_paginas") or 0) > 0
+                            or diagnostico.get("ocr_status") == "ERRO"):
+                        erros.append({
+                            "fonte": documento.get("fonte"),
+                            "titulo": documento.get("titulo"),
+                            "url_pdf": documento.get("url_pdf"),
+                            "etapa": "COBERTURA_LEITURA_PDF",
+                            "erro": f"status={status}; erros_paginas={diagnostico.get('erros_paginas', 0)}; ocr={diagnostico.get('ocr_status')}",
+                        })
                 documento["total_resultados"] = (
                     len(resultados_pdf)
                 )
@@ -2528,6 +2770,15 @@ def pesquisar_processos_anvisa_dicol(
             sessao.close()
         except Exception:
             pass
+
+    if incluir_baseline_historico:
+        for fonte in ANVISA_FONTES:
+            if not any(doc.get("fonte") == fonte for doc in documentos):
+                erros.append({"fonte": fonte, "etapa": "FONTE_SEM_DOCUMENTOS",
+                              "erro": "Nenhum PDF localizado para esta fonte"})
+        if not documentos:
+            erros.append({"fonte": "ANVISA_DICOL", "etapa": "SEM_DOCUMENTOS",
+                          "erro": "Revisão sem PDFs não comprova ausência de ocorrências"})
 
     resultados.sort(
         key=lambda item: (
