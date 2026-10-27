@@ -233,35 +233,154 @@ def pesquisar_lote(params):
             context=browser.new_context(locale='pt-BR',viewport={'width':1380,'height':900})
             page=context.new_page()
             for dado in processos:
-                numero=dado['processo']
-                indice_falhas=len(falhas); indice_relatorios=len(relatorios)
-                modalidades=[('Resultado exato',numero,True)]
+                numero = dado['processo']
+                indice_falhas = len(falhas)
+                indice_relatorios = len(relatorios)
+                modalidades = [('Resultado exato', numero, True)]
+
                 if ampliada:
-                    prefixo=numero.split('/')[0]
-                    modalidades.append(('Busca ampliada',prefixo,False))
-                try:
-                    for modo,termo,exata in modalidades:
-                        publish(mensagem=f'Pesquisando {feitos+1}/{len(processos)}: {numero} — {modo}')
-                        log('Pesquisa '+numero+' / '+modo)
-                        resp=page.goto(url_pesquisa(termo,inicio,fim,exata),wait_until='domcontentloaded',timeout=60000)
-                        if resp and resp.status>=400:raise RuntimeError('HTTP '+str(resp.status))
-                        results,rel=paginas_resultado(page,termo,modo,max_paginas=300)
-                        rel['processo']=numero;relatorios.append(rel)
-                        if not rel['completa']:falhas.append({'processo':numero,'erro':'Cobertura não confirmada em '+modo+'; '+ '; '.join(rel['problemas'])})
-                        for x in results:
-                            u=x['url']
+                    prefixo = numero.split('/')[0]
+                    modalidades.append(('Busca ampliada', prefixo, False))
+
+                ultimo_erro = None
+                relatorios_tentativa = []
+
+                for tentativa in range(1, 4):
+                    relatorios_tentativa = []
+                    achados_tentativa = {}
+
+                    try:
+                        for modo, termo, exata in modalidades:
+                            publish(
+                                mensagem=(
+                                    f'Pesquisando {feitos+1}/{len(processos)}: '
+                                    f'{numero} - tentativa {tentativa}/3'
+                                )
+                            )
+                            log(
+                                f'Pesquisa {numero} / {modo} / '
+                                f'tentativa {tentativa}/3'
+                            )
+
+                            resp = page.goto(
+                                url_pesquisa(termo, inicio, fim, exata),
+                                wait_until='domcontentloaded',
+                                timeout=60000
+                            )
+
+                            if resp is None:
+                                raise RuntimeError(
+                                    'Navegacao sem resposta HTTP'
+                                )
+
+                            if resp.status >= 400:
+                                raise RuntimeError(
+                                    'HTTP ' + str(resp.status)
+                                )
+
+                            results, rel = paginas_resultado(
+                                page, termo, modo, max_paginas=300
+                            )
+                            rel['processo'] = numero
+                            relatorios_tentativa.append(rel)
+
+                            if not rel.get('completa'):
+                                raise RuntimeError(
+                                    'Cobertura nao confirmada em '
+                                    + modo + ': '
+                                    + '; '.join(
+                                        str(x)
+                                        for x in rel.get('problemas', [])
+                                    )
+                                )
+
+                            for x in results:
+                                u = x['url']
+
+                                if u not in achados_tentativa:
+                                    achados_tentativa[u] = {
+                                        **x,
+                                        'processos': [],
+                                        'fontes': []
+                                    }
+
+                                item = achados_tentativa[u]
+
+                                if (
+                                    numero not in item['processos']
+                                    and (
+                                        exata
+                                        or validar(x, numero)
+                                        != 'Conferir publicação'
+                                    )
+                                ):
+                                    item['processos'].append(numero)
+
+                                item['fontes'] = list(dict.fromkeys(
+                                    item['fontes'] + [modo]
+                                ))
+
+                        # Confirmar todas as modalidades antes de
+                        # incorporar os resultados ao lote.
+                        relatorios.extend(relatorios_tentativa)
+
+                        for u, item in achados_tentativa.items():
                             if u not in achados:
-                                achados[u]={**x,'processos':[]}
-                            if numero not in achados[u]['processos']:
-                                # In exact mode, results are candidates; expanded mode must be checked.
-                                if exata or validar(x,numero)!='Conferir publicação':
-                                    achados[u]['processos'].append(numero)
-                            achados[u]['fontes']=list(dict.fromkeys(achados[u]['fontes']+[modo]))
-                    log('Processo concluído: '+numero)
-                except Exception as exc:
-                    falhas.append({'processo':numero,'erro':str(exc)[:300]})
-                    log('FALHA '+numero+': '+str(exc)[:300])
-                feitos+=1
+                                achados[u] = item
+                            else:
+                                achados[u]['processos'] = list(
+                                    dict.fromkeys(
+                                        achados[u]['processos']
+                                        + item['processos']
+                                    )
+                                )
+                                achados[u]['fontes'] = list(
+                                    dict.fromkeys(
+                                        achados[u]['fontes']
+                                        + item['fontes']
+                                    )
+                                )
+
+                        ultimo_erro = None
+                        log(
+                            f'Processo concluido: {numero} '
+                            f'na tentativa {tentativa}/3'
+                        )
+                        break
+
+                    except Exception as exc:
+                        ultimo_erro = str(exc)[:300]
+                        log(
+                            f'FALHA {numero} tentativa '
+                            f'{tentativa}/3: {ultimo_erro}'
+                        )
+
+                        if tentativa < 3:
+                            try:
+                                page.close()
+                            except Exception:
+                                pass
+
+                            time.sleep(2 * tentativa)
+                            page = context.new_page()
+
+                if ultimo_erro is not None:
+                    # Preservar somente o diagnostico da ultima
+                    # tentativa, sem incorpora-lo como cobertura valida.
+                    relatorios.extend(relatorios_tentativa)
+                    falhas.append({
+                        'processo': numero,
+                        'erro': (
+                            'Falhou apos 3 tentativas: '
+                            + ultimo_erro
+                        )
+                    })
+                    log(
+                        'FALHA DEFINITIVA ' + numero
+                        + ': ' + ultimo_erro
+                    )
+
+                feitos += 1
                 rels=relatorios[indice_relatorios:]
                 quantidade=sum(1 for x in achados.values() if numero in x['processos'])
                 falhou=len(falhas)>indice_falhas or len(rels)!=len(modalidades) or not all(r.get('completa') for r in rels)
