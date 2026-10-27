@@ -88,7 +88,18 @@ def _salvar_atomico(caminho: Path, valor: dict[str, Any]) -> None:
             f.write('\n')
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temporario, caminho)
+        # BLOQUEIO_TEMPORARIO_JSON_DEV
+        import time
+        for tentativa in range(1, 19):
+            try:
+                os.replace(temporario, caminho)
+                if tentativa > 1:
+                    print("[GRADE] Gravacao concluida apos", tentativa, "tentativas")
+                break
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or tentativa == 18:
+                    raise
+                time.sleep(min(0.1 * tentativa, 0.5))
     finally:
         if os.path.exists(temporario):
             os.unlink(temporario)

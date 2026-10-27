@@ -294,7 +294,7 @@ def executar_dou(dia, processos, pasta, reg):
             'relatorio_txt':str(caminho_txt),'sha256_relatorio':sha256(caminho_txt),
             'publicacoes_palavras_chave':publicacoes,
         })
-        print('[DOU] Palavras-chave INLABS pesquisadas:',len(publicacoes))
+        print('[DOU] Publicacoes ligadas a palavras-chave encontradas:',len(publicacoes))
     except Exception as exc:
         erros.append('PALAVRAS_CHAVE_INLABS: '+str(exc))
         if not controle_pipeline.is_file():
@@ -514,7 +514,8 @@ def executar_dicol(dia, processos, pasta, reg):
             finally:
                 (anual.PROCESSOS_PESQUISA,anual.ANVISA_PDFS_DIR,
                  anual.ANVISA_OCR_DIR,anual.ANVISA_DEBUG_DIR) = campos_originais
-        prova = pasta.parent/'evidencias'/('dicol_'+fonte.lower()+'_arquivo.json')
+        from uuid import uuid4
+        prova = pasta.parent/'evidencias'/('dicol_'+fonte.lower()+'_arquivo_'+uuid4().hex+'.json')
         catalogo_ok = not erros_catalogo and bool(lista) and not any(e.get('etapa') in ('DOWNLOAD','CONEXAO') for e in erros_pdf)
         acervo_ok = bool(diagnosticos) and not erros_pdf
         guardar_atomico(prova,{'data':data,'consultado_em':consultado_em,
@@ -615,7 +616,7 @@ def evidencia_processo_valida(dia, pasta, numero, fonte, registro):
                 return False
             if arquivo.parent.parent.name != dia:
                 return False
-            if arquivo.parent.parent.parent.name != 'monitoramento_diario_operacional':
+            if arquivo.parent.parent.resolve() != pasta.parent.resolve():
                 return False
 
             acervo = (
@@ -1051,7 +1052,7 @@ def montar_mensagem_email(dia, resumo, completo, linhas, pasta):
     if modalidade == 'CONTINGENCIA_V7':
         situacao_palavras = (
             "Nao pesquisadas: INLABS indisponivel. "
-            "Dispensadas na modalidade contingencia V7."
+            "A contingencia cobre somente os processos."
         )
         situacao_geral = (
             "Cobertura processual completa por contingencia V7."
@@ -1113,20 +1114,23 @@ def montar_mensagem_email(dia, resumo, completo, linhas, pasta):
             "Marcador do status do email nao encontrado"
         )
 
-    status_html = (
-        '<strong>Status do monitoramento - '
-        + data.strftime("%d/%m/%Y")
-        + '</strong><br><br>'
-        + '<strong>Processos:</strong> '
-        + escapar_html(situacao_processos)
-        + '<br><br>'
-        + '<strong>Palavras-chave:</strong> '
-        + escapar_html(situacao_palavras)
-        + '<br><br><strong>Modalidade DOU:</strong> '
-        + escapar_html(modalidade)
+    from backend.services.relatorio_status_email_diario import montar_quadro_status
+    status_html, vazio_processos, vazio_palavras = montar_quadro_status(
+        dia=dia, pasta=pasta, comprovado=comprovado, modalidade=modalidade,
+        carteira_validada=carteira_validada, id_processo=id_processo,
+        evidencia_processo_valida=evidencia_processo_valida,
     )
-
     html = html.replace(marcador, status_html, 1)
+
+    # A mesma frase generica era usada para pesquisas concluidas e nao realizadas.
+    separador = '<h3>OUTRAS PUBLICAÇÕES RELEVANTES</h3>'
+    inicio, achou, fim = html.partition(separador)
+    if not achou:
+        raise RuntimeError('Titulo de outras publicacoes nao encontrado no HTML')
+    marcador_vazio = 'Nenhum registro nesta seção.'
+    inicio = inicio.replace(marcador_vazio, vazio_processos, 1)
+    fim = fim.replace(marcador_vazio, vazio_palavras, 1)
+    html = inicio + achou + fim
 
     assunto = modelo.montar_assunto_email(
         data_execucao=data,
