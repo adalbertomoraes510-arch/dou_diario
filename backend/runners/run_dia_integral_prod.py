@@ -741,6 +741,60 @@ def evidencia_processo_valida(dia, pasta, numero, fonte, registro):
         return False
 
 
+
+def _modalidade_email(pasta, origens_dou):
+    """Distingue INLABS integral de contingencia V7 comprovada."""
+    palavras_ok, _, erro = _palavras_chave_comprovadas(pasta)
+
+    if palavras_ok:
+        return True, 'INLABS_INTEGRAL'
+
+    evidencia = pasta.parent / 'evidencias' / 'dou_inlabs_palavras_chave.json'
+
+    try:
+        dados = json.loads(evidencia.read_text(encoding='utf-8-sig'))
+
+        if (
+            dados.get('data') != pasta.parent.name
+            or dados.get('status') != 'NAO_FOI_POSSIVEL_PESQUISAR'
+        ):
+            return False, 'INLABS_NAO_COMPROVADO'
+
+        motivo = str(dados.get('erro') or '').lower()
+
+        indisponibilidade = any(
+            termo in motivo
+            for termo in (
+                '404', '502', '503', '504',
+                'timeout', 'timed out',
+                'connection refused',
+                'connection error',
+                'connectionerror',
+                'name resolution',
+                'dns'
+            )
+        )
+
+        if not indisponibilidade:
+            return False, 'FALHA_INLABS_SEM_INDISPONIBILIDADE_COMPROVADA'
+
+        if not origens_dou:
+            return False, 'CONTINGENCIA_SEM_PROCESSOS'
+
+        for origem, referencia in origens_dou:
+            if (
+                origem != 'SITE_DOU'
+                or not Path(str(referencia or '')).name.startswith('dou_v7')
+                or not str(referencia).lower().endswith('.json')
+            ):
+                return False, 'CONTINGENCIA_NAO_COMPROVADA'
+
+        return True, 'CONTINGENCIA_V7'
+
+    except (OSError, ValueError, TypeError, KeyError):
+        return False, 'EVIDENCIA_INLABS_INVALIDA'
+
+
 def preparar_relatorio_email(dia, pasta, reg):
     """Inclui SEMPRE os 36 processos e suas tres fontes. Nao infere completude."""
     documento = json.loads(reg.caminho_dia(dia, pasta).read_text(encoding='utf-8-sig'))
@@ -774,7 +828,14 @@ def preparar_relatorio_email(dia, pasta, reg):
                 for numero in esperados
             )
             if completo:
-                completo = _palavras_chave_comprovadas(pasta)[0]
+                origens_dou = [
+                    (
+                        encontrados[numero]['fontes']['DOU'].get('origem'),
+                        (encontrados[numero]['fontes']['DOU'].get('evidencia') or {}).get('referencia')
+                    )
+                    for numero in esperados
+                ]
+                completo = _modalidade_email(pasta, origens_dou)[0]
     except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
         print('[EMAIL] Cobertura nao comprovada:', str(exc)[:300])
         completo = False
@@ -959,7 +1020,13 @@ def montar_mensagem_email(dia, resumo, completo, linhas, pasta):
                 "Nao pesquisadas. Acesso ao INLABS nao confirmado."
             )
 
-    integral = bool(completo and processos_ok and comprovado)
+    origens_dou = [
+        (origem, referencia)
+        for proc, fonte, estado, origem, n, erro, referencia in linhas
+        if fonte == 'DOU'
+    ]
+    modalidade_ok, modalidade = _modalidade_email(pasta, origens_dou)
+    integral = bool(completo and processos_ok and modalidade_ok)
     situacao_geral = (
         "Cobertura integral."
         if integral
@@ -981,9 +1048,20 @@ def montar_mensagem_email(dia, resumo, completo, linhas, pasta):
     situacao_palavras = legivel(situacao_palavras)
     situacao_geral = legivel(situacao_geral).replace("Situacao", "Situa\u00e7\u00e3o").replace("nao", "n\u00e3o").replace("concluidas", "conclu\u00eddas"); situacao_palavras = situacao_palavras.replace("devido a indisponibilidade", "devido \u00e0 indisponibilidade")
 
+    if modalidade == 'CONTINGENCIA_V7':
+        situacao_palavras = (
+            "Nao pesquisadas: INLABS indisponivel. "
+            "Dispensadas na modalidade contingencia V7."
+        )
+        situacao_geral = (
+            "Cobertura processual completa por contingencia V7."
+            if integral else "Cobertura processual incompleta."
+        )
+
     resumo_texto = [
         "Status do monitoramento - " + data.strftime("%d/%m/%Y"),
         "",
+        "Modalidade DOU: " + modalidade,
         "Processos: " + situacao_processos,
         "Palavras-chave: " + situacao_palavras,
     ]
@@ -1044,7 +1122,8 @@ def montar_mensagem_email(dia, resumo, completo, linhas, pasta):
         + '<br><br>'
         + '<strong>Palavras-chave:</strong> '
         + escapar_html(situacao_palavras)
-
+        + '<br><br><strong>Modalidade DOU:</strong> '
+        + escapar_html(modalidade)
     )
 
     html = html.replace(marcador, status_html, 1)
