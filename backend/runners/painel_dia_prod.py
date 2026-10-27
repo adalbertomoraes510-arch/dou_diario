@@ -109,13 +109,13 @@ class Handler(BaseHTTPRequestHandler):
             dados=json.loads(self.rfile.read(tamanho))
             dia=_data(dados.get("data"))
 
-            if dados.get("confirmacao") != "REENVIAR_RELATORIO":
+            if dados.get("confirmacao") != "CONCLUIR_EMAIL":
                 raise ValueError("Confirmacao obrigatoria")
 
             from backend.runners import reenvio_manual_prod
             situacao=reenvio_manual_prod.situacao(dia)
 
-            if not situacao["reenviavel"]:
+            if not situacao["concluir_disponivel"]:
                 self._enviar({"erro":situacao["mensagem"]},409)
                 return
 
@@ -157,13 +157,13 @@ class Handler(BaseHTTPRequestHandler):
                     log=arquivo,
                     data=dia,
                     comando=comando,
-                    fluxo="reenvio"
+                    fluxo="envio"
                 )
 
             self._enviar({
                 "status":"INICIADO",
                 "data":dia,
-                "tipo":"reenvio"
+                "tipo":"envio"
             })
 
         except (ValueError,TypeError,json.JSONDecodeError) as exc:
@@ -187,6 +187,15 @@ class Handler(BaseHTTPRequestHandler):
             data=_data(dados.get('data'))
             modo=dados.get('modo')
             if modo not in ('preflight','executar'):raise ValueError('Modo invalido')
+            if modo == 'executar':
+                from backend.runners import reenvio_manual_prod
+                situacao = reenvio_manual_prod.situacao(data)
+                if situacao.get('cobertura_completa'):
+                    self._enviar({'erro':'Pesquisas completas. Use Concluir e enviar e-mail; nao repita pesquisas.'},409)
+                    return
+                if situacao.get('envio_pendente'):
+                    self._enviar({'erro':'Envio indeterminado. Verifique antes de reprocessar.'},409)
+                    return
             with TRAVA:
                 proc=ATUAL['proc']
                 if proc and proc.poll() is None:

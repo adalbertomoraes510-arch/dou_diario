@@ -25,171 +25,91 @@ def caminhos(dia):
 
 
 def situacao(dia):
+    """Consulta somente leitura: usa a grade e as provas reais do executor."""
     pasta, grade = caminhos(dia)
+    arquivo_grade = reg.caminho_dia(dia, grade)
+    resumo_arquivo = pasta / 'resumo_execucao.json'
 
-    comprovante = pasta / ("comprovante_relatorio_" + dia + ".json")
-    relatorio = pasta / ("relatorio_diario_" + dia + ".txt")
+    if not arquivo_grade.is_file():
+        return {
+            'data': dia, 'gerado': False, 'enviado': False,
+            'envio_pendente': False, 'reenviavel': False,
+            'concluir_disponivel': False, 'reprocessavel': True,
+            'cobertura_completa': False, 'mensagem':
+            'Nenhuma pesquisa registrada para esta data. Execute o monitoramento.'
+        }
 
-    gerado = False
-    if comprovante.is_file() and relatorio.is_file():
-        try:
-            prova = json.loads(comprovante.read_text(encoding="utf-8-sig"))
-            hash_atual = hashlib.sha256(relatorio.read_bytes()).hexdigest()
-            gerado = (
-                prova.get("status") == "GERADO"
-                and prova.get("sha256") == hash_atual
-            )
-        except (OSError, ValueError, TypeError):
-            gerado = False
+    completo = False
+    modalidade = 'NAO_COMPROVADA'
+    try:
+        _, completo, linhas, _ = runner.preparar_relatorio_email(dia, grade, reg)
+        origens = [(origem, ref) for _, fonte, _, origem, _, _, ref in linhas if fonte == 'DOU']
+        _, modalidade = runner._modalidade_email(grade, origens)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        motivo = 'Falha ao validar cobertura: ' + str(exc)[:180]
+    else:
+        motivo = ''
 
     enviado = False
     pendente = False
-    pasta_email = pasta / "email_operacional"
-
-    if pasta_email.is_dir():
-        for arq in pasta_email.glob("*.json"):
+    controles = pasta / 'email_operacional'
+    if controles.is_dir():
+        for comprovante in controles.glob('*.json'):
             try:
-                prova = json.loads(arq.read_text(encoding="utf-8-sig"))
-                if prova.get("data") != dia:
+                registro = json.loads(comprovante.read_text(encoding='utf-8-sig'))
+                if registro.get('data') != dia:
                     continue
-
-                status = prova.get("status")
-                if status == "ENVIADO":
+                status = registro.get('status')
+                if status == 'ENVIADO':
                     enviado = True
-                    anexo = prova.get("anexo")
-                    hash_anexo = prova.get("sha256_anexo")
-                    if anexo and hash_anexo:
-                        caminho_anexo = Path(anexo)
-                        if caminho_anexo.is_file():
-                            valido = (
-                                hashlib.sha256(
-                                    caminho_anexo.read_bytes()
-                                ).hexdigest() == hash_anexo
-                            )
-                            gerado = gerado or valido
-
-                if status in ("ENVIO_INICIADO", "ENVIO_INDETERMINADO"):
+                elif status in ('ENVIO_INICIADO', 'ENVIO_INDETERMINADO'):
                     pendente = True
-
             except (OSError, ValueError, TypeError):
                 pendente = True
 
-    configurado = bool(runner.configuracao_email_prod())
-    reenviavel = gerado and not pendente and configurado
+    # Nao liberar novas mensagens para uma data com envio confirmado.
+    # Casos de envio indeterminado exigem verificacao manual antes do reenvio.
+    try:
+        configurado = bool(runner.configuracao_email_prod())
+    except (OSError, RuntimeError, ValueError):
+        configurado = False
+    concluir = bool(completo and configurado and not pendente and not enviado)
+    reprocessavel = not completo and not pendente
 
     if pendente:
-        mensagem = "Envio pendente de verificacao; reenvio bloqueado"
-    elif not gerado:
-        mensagem = "Relatorio ainda nao gerado para esta data"
-    elif not configurado:
-        mensagem = "Relatorio gerado; envio PROD nao habilitado"
+        mensagem = 'Envio indeterminado ou iniciado: verificar comprovante antes de nova tentativa.'
     elif enviado:
-        mensagem = "Relatorio gerado e ja enviado; reenvio disponivel"
+        mensagem = 'Email de ' + dia + ' ja enviado. Novo envio automatico bloqueado.'
+    elif completo and not configurado:
+        mensagem = 'Pesquisas completas; envio PROD nao habilitado.'
+    elif completo:
+        mensagem = 'Pesquisas completas (' + modalidade + '). Concluir e enviar email sem repetir pesquisas.'
     else:
-        mensagem = "Relatorio gerado; envio manual disponivel"
+        mensagem = motivo or 'Cobertura incompleta. Reprocessar somente as atividades pendentes.'
 
     return {
-        "data": dia,
-        "gerado": gerado,
-        "enviado": enviado,
-        "envio_pendente": pendente,
-        "reenviavel": reenviavel,
-        "mensagem": mensagem
+        'data': dia, 'gerado': arquivo_grade.is_file(),
+        'resumo_disponivel': resumo_arquivo.is_file(),
+        'enviado': enviado, 'envio_pendente': pendente,
+        'reenviavel': concluir, 'concluir_disponivel': concluir,
+        'reprocessavel': reprocessavel, 'cobertura_completa': bool(completo),
+        'modalidade': modalidade, 'mensagem': mensagem
     }
 
 
 def reenviar(dia):
-    from backend.services.email_service import enviar_email
-
+    """Conclui envio pendente usando controle idempotente oficial, sem pesquisas."""
     with runner.bloquear_execucao_concorrente():
         estado = situacao(dia)
-        if not estado["reenviavel"]:
-            raise RuntimeError(estado["mensagem"])
-
-        pasta, grade = caminhos(dia)
-        destinatario = runner.configuracao_email_prod()
-
-        resumo, completo, linhas, assinaturas = (
-            runner.preparar_relatorio_email(dia, grade, reg)
-        )
-
-        if not completo:
-            raise RuntimeError(
-                "REENVIO BLOQUEADO: pesquisas obrigatorias incompletas."
-            )
-
-        assunto, texto, html = runner.montar_mensagem_email(
-            dia, resumo, completo, linhas, grade
-        )
-
-        pasta_email = pasta / "email_operacional"
-        pasta_email.mkdir(parents=True, exist_ok=True)
-
-        identificador = (
-            dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            + "_"
-            + uuid.uuid4().hex[:12]
-        )
-
-        anexo = pasta_email / ("relatorio_reenvio_" + identificador + ".txt")
-        comprovante = pasta_email / ("reenvio_" + identificador + ".json")
-
-        anexo.write_text(texto, encoding="utf-8")
-
-        registro = {
-            "tipo": "REENVIO_MANUAL",
-            "data": dia,
-            "identificador": identificador,
-            "destinatarios": destinatario,
-            "assunto": assunto,
-            "anexo": str(anexo),
-            "sha256_anexo": hashlib.sha256(
-                anexo.read_bytes()
-            ).hexdigest(),
-            "status": "ENVIO_INICIADO",
-            "iniciado_em": dt.datetime.now().isoformat(
-                timespec="seconds"
-            )
-        }
-
-        runner.guardar_atomico(comprovante, registro)
-
-        try:
-            resposta = enviar_email(
-                assunto=assunto,
-                corpo_html=html,
-                corpo_texto=texto,
-                anexo=anexo,
-                destinatarios=destinatario,
-                modo_simulacao=False
-            )
-
-            retorno = str(
-                (resposta or {}).get("status") or ""
-            ).upper()
-
-            if retorno == "ENVIADO":
-                registro["status"] = "ENVIADO"
-                registro["confirmado_em"] = dt.datetime.now().isoformat(
-                    timespec="seconds"
-                )
-                runner.guardar_atomico(comprovante, registro)
-                print("REENVIO_MANUAL: ENVIADO", flush=True)
-                print("COMPROVANTE:", comprovante, flush=True)
-                return 0
-
-            registro["status"] = "FALHA_ENVIO"
-            registro["retorno_servico"] = retorno
-            runner.guardar_atomico(comprovante, registro)
-            print("REENVIO_MANUAL: FALHA_ENVIO", flush=True)
-            return 3
-
-        except Exception as erro:
-            registro["status"] = "ENVIO_INDETERMINADO"
-            registro["erro"] = str(erro)[:600]
-            runner.guardar_atomico(comprovante, registro)
-            print("REENVIO_MANUAL: ENVIO_INDETERMINADO", flush=True)
-            return 4
+        if not estado['concluir_disponivel']:
+            raise RuntimeError(estado['mensagem'])
+        _, grade = caminhos(dia)
+        resultado = runner.enviar_relatorio_operacional_dev(dia, grade, reg)
+        status = str(resultado.get('status') or '')
+        print('STATUS_EMAIL:', status, flush=True)
+        if resultado.get('comprovante'):
+            print('COMPROVANTE:', resultado['comprovante'], flush=True)
+        return 0 if status == 'ENVIADO' else 3
 
 
 def main():

@@ -70,7 +70,7 @@ main{max-width:1400px;margin:18px auto;padding:0 12px}h1{font-size:26px;margin-b
 <h1>Monitoramento Di&aacute;rio &mdash; DOU + DICOL</h1><p class="muted">Processamento isolado por data. Mesmo executor do terminal, sem revisão histórica. Ambiente de produção; execuções reais exigem confirmação.</p>
 <div class="panel"><label for="dia">Data a processar</label><input type="date" id="dia"  min="2026-01-01" max="2026-12-31"><div><button id="btnRun">Executar monitoramento di&aacute;rio</button>
 <button id="btnReenviar" class="secondary" disabled>
-  Reenviar relat&oacute;rio
+  Concluir e enviar e-mail
 </button></div>
 <div id="situacaoRelatorio"
      role="status"
@@ -107,8 +107,7 @@ main{max-width:1400px;margin:18px auto;padding:0 12px}h1{font-size:26px;margin-b
 <section class="panel">
   <h2>Historico de execucoes</h2>
   <p class="muted">
-    Meses e dias pesquisados no DEV. Clique para expandir os detalhes.
-    Registros de teste nao representam execucoes de producao.
+    Meses e dias pesquisados no PROD. Clique para expandir os detalhes.
   </p>
   <div id="historico">Carregando historico...</div>
 </section>
@@ -119,7 +118,7 @@ async function atualizar(){try{const r=await fetch('/api/status',{cache:'no-stor
 botoes.forEach(b=>b.disabled=ocup);
 dia.disabled=ocup;
 document.querySelector('#indicadorProcessamento').classList.toggle('ativo',ocup)}catch(e){statusEl.textContent='Falha na comunicação com o painel'}}
-async function executar(modo){if(modo==='executar'&&!confirm('Executar a pesquisa real para '+dia.value+' e enviar o e-mail aos destinatários configurados no PROD?'))return;
+async function executar(modo){if(modo==='executar'&&!confirm((botoes[0].textContent.includes('Reprocessar')?'Reprocessar somente pendências registradas para ':'Executar a pesquisa real para ')+dia.value+'? Se a cobertura ficar completa, o sistema poderá enviar o e-mail configurado no PROD.'))return;
  botoes.forEach(b=>b.disabled=true);
 dia.disabled=true;
 document.querySelector('#indicadorProcessamento').classList.add('ativo');
@@ -263,6 +262,7 @@ setInterval(atualizarHistorico,10000);
 
   let versao=0;
   let bloqueioLocal=false;
+  let execucaoOcupada=false;
 
   async function verificar(){
     const atual=++versao;
@@ -283,9 +283,10 @@ setInterval(atualizarHistorico,10000);
       if(atual!==versao || data.value!==diaSelecionado)return;
 
       const ocupado=execucao.status==='EM_EXECUCAO';
+      execucaoOcupada=ocupado;
 
-      data.disabled=ocupado;
-      btnRun.disabled=ocupado;
+      data.disabled=ocupado || bloqueioLocal;
+      btnRun.disabled=ocupado || bloqueioLocal;
 
       if(!resposta.ok){
         aviso.textContent=info.erro||
@@ -295,9 +296,10 @@ setInterval(atualizarHistorico,10000);
       }
 
       aviso.textContent=info.mensagem;
-      aviso.style.color=info.gerado?'#17623c':'#805200';
-
-      btnRe.disabled=ocupado||bloqueioLocal||!info.reenviavel;
+      aviso.style.color=info.cobertura_completa?'#17623c':'#805200';
+      btnRun.textContent=info.gerado?'Reprocessar pendências':'Executar monitoramento diário';
+      btnRun.disabled=ocupado||bloqueioLocal||!info.reprocessavel;
+      btnRe.disabled=ocupado||bloqueioLocal||!info.concluir_disponivel;
 
     }catch(erro){
       if(atual!==versao)return;
@@ -312,16 +314,16 @@ setInterval(atualizarHistorico,10000);
     const diaSelecionado=data.value;
 
     if(!confirm(
-      'Reenviar o relatorio de '+diaSelecionado+
+      'Concluir e enviar o relatorio de '+diaSelecionado+
       ' aos destinatarios configurados no PROD? '+
-      'As pesquisas nao serao repetidas.'
+      'Nenhuma pesquisa sera repetida.'
     ))return;
 
     bloqueioLocal=true;
     data.disabled=true;
     btnRun.disabled=true;
     btnRe.disabled=true;
-    aviso.textContent='REENVIO EM ANDAMENTO';
+    aviso.textContent='ENVIO DE EMAIL EM ANDAMENTO';
 
     try{
       const resposta=await fetch('/api/reenviar',{
@@ -329,7 +331,7 @@ setInterval(atualizarHistorico,10000);
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
           data:diaSelecionado,
-          confirmacao:'REENVIAR_RELATORIO'
+          confirmacao:'CONCLUIR_EMAIL'
         })
       });
 
@@ -339,7 +341,7 @@ setInterval(atualizarHistorico,10000);
         alert(info.erro||'Falha ao iniciar reenvio');
       }else{
         aviso.textContent=
-          'Reenvio iniciado. Acompanhe o status da execucao.';
+          'Envio iniciado. Acompanhe o status da execucao.';
       }
 
     }catch(erro){
