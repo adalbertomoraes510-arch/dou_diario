@@ -42,7 +42,7 @@ def situacao(dia):
     completo = False
     modalidade = 'NAO_COMPROVADA'
     try:
-        _, completo, linhas, _ = runner.preparar_relatorio_email(dia, grade, reg)
+        resumo, completo, linhas, assinaturas = runner.preparar_relatorio_email(dia, grade, reg)
         origens = [(origem, ref) for _, fonte, _, origem, _, _, ref in linhas if fonte == 'DOU']
         _, modalidade = runner._modalidade_email(grade, origens)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -50,7 +50,7 @@ def situacao(dia):
     else:
         motivo = ''
 
-    enviado = False
+    enviado_anterior = False
     pendente = False
     controles = pasta / 'email_operacional'
     if controles.is_dir():
@@ -61,7 +61,7 @@ def situacao(dia):
                     continue
                 status = registro.get('status')
                 if status == 'ENVIADO':
-                    enviado = True
+                    enviado_anterior = True
                 elif status in ('ENVIO_INICIADO', 'ENVIO_INDETERMINADO'):
                     pendente = True
             except (OSError, ValueError, TypeError):
@@ -73,15 +73,37 @@ def situacao(dia):
         configurado = bool(runner.configuracao_email_prod())
     except (OSError, RuntimeError, ValueError):
         configurado = False
-    concluir = bool(completo and configurado and not pendente and not enviado)
+    enviado = False
+    identificador_atual = None
+    erro_versao = ''
+    if completo and configurado and not pendente:
+        try:
+            _, texto, html = runner.montar_mensagem_email(dia, resumo, completo, linhas, grade)
+            identificador_atual = runner.identificador_conteudo_email(
+                dia, runner.configuracao_email_prod(), assinaturas, texto, html)
+            controle_atual = controles / ('envio_' + identificador_atual + '.json')
+            if controle_atual.is_file():
+                prova_atual = json.loads(controle_atual.read_text(encoding='utf-8-sig'))
+                if prova_atual.get('identificador') != identificador_atual or prova_atual.get('data') != dia:
+                    raise RuntimeError('Comprovante da versao atual inconsistente')
+                enviado = prova_atual.get('status') == 'ENVIADO'
+                pendente = pendente or prova_atual.get('status') in ('ENVIO_INICIADO', 'ENVIO_INDETERMINADO')
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            erro_versao = 'Falha ao preparar versao atual: ' + str(exc)[:180]
+            identificador_atual = None
+    concluir = bool(completo and configurado and not pendente and not enviado and identificador_atual)
     reprocessavel = not completo and not pendente
 
     if pendente:
         mensagem = 'Envio indeterminado ou iniciado: verificar comprovante antes de nova tentativa.'
     elif enviado:
         mensagem = 'Email de ' + dia + ' ja enviado. Novo envio automatico bloqueado.'
+    elif erro_versao:
+        mensagem = erro_versao
     elif completo and not configurado:
         mensagem = 'Pesquisas completas; envio PROD nao habilitado.'
+    elif completo and enviado_anterior:
+        mensagem = 'Nova versao do relatorio disponivel. Envio anterior preservado. Concluir e enviar email.'
     elif completo:
         mensagem = 'Pesquisas completas (' + modalidade + '). Concluir e enviar email sem repetir pesquisas.'
     else:
@@ -90,7 +112,8 @@ def situacao(dia):
     return {
         'data': dia, 'gerado': arquivo_grade.is_file(),
         'resumo_disponivel': resumo_arquivo.is_file(),
-        'enviado': enviado, 'envio_pendente': pendente,
+        'enviado': enviado, 'envio_anterior': enviado_anterior,
+        'versao_atual': identificador_atual, 'envio_pendente': pendente,
         'reenviavel': concluir, 'concluir_disponivel': concluir,
         'reprocessavel': reprocessavel, 'cobertura_completa': bool(completo),
         'modalidade': modalidade, 'mensagem': mensagem

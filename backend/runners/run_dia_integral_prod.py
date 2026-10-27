@@ -1139,6 +1139,12 @@ def montar_mensagem_email(dia, resumo, completo, linhas, pasta):
 
     return assunto, '\n'.join(texto) + '\n', html
 
+def identificador_conteudo_email(dia, email, assinaturas, texto, html):
+    assinatura_bytes = json.dumps(
+        {'data':dia,'destinatarios':sorted(e.casefold() for e in email),'versao':6,'grade':assinaturas,'conteudo_email':hashlib.sha256((texto+html).encode('utf-8')).hexdigest()},
+        ensure_ascii=False, sort_keys=True, separators=(',',':')).encode('utf-8')
+    return hashlib.sha256(assinatura_bytes).hexdigest()
+
 def enviar_relatorio_operacional_dev(dia, pasta, reg):
     """Envia e guarda prova; uma mensagem por versao substantiva dos resultados."""
     if ROOT.name.casefold() != 'dou_diario_prod':
@@ -1152,10 +1158,7 @@ def enviar_relatorio_operacional_dev(dia, pasta, reg):
         print('[EMAIL] BLOQUEADO: existem pesquisas obrigatorias incompletas.')
         return {'status': 'EMAIL_BLOQUEADO_PENDENCIAS'}
     classificacao, texto, html = montar_mensagem_email(dia, resumo, completo, linhas, pasta)
-    assinatura_bytes = json.dumps(
-        {'data':dia,'destinatarios':sorted(e.casefold() for e in email),'versao':6,'grade':assinaturas,'conteudo_email':hashlib.sha256((texto+html).encode('utf-8')).hexdigest()},
-        ensure_ascii=False, sort_keys=True, separators=(',',':')).encode('utf-8')
-    identificador = hashlib.sha256(assinatura_bytes).hexdigest()
+    identificador = identificador_conteudo_email(dia, email, assinaturas, texto, html)
     pasta_saida = pasta.parent/'email_operacional'
     caminho_controle = pasta_saida/f'envio_{identificador}.json'
     anexo = pasta_saida/f'relatorio_{identificador}.txt'
