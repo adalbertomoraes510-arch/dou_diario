@@ -119,8 +119,8 @@ async function atualizar(){
 if(atualizacaoStatusEmAndamento)return;
 atualizacaoStatusEmAndamento=true;
 try{const r=await fetch('/api/status',{cache:'no-store'});const j=await r.json();statusEl.textContent=j.status+(j.data?' — '+j.data:'');saida.textContent=j.saida||'Sem saída ainda';saida.scrollTop=saida.scrollHeight;const ocup=j.status==='EM_EXECUCAO';
-botoes.forEach(b=>b.disabled=ocup);
-dia.disabled=ocup;
+if(ocup){botoes.forEach(b=>b.disabled=true);}
+if(ocup){dia.disabled=true;}
 document.querySelector('#indicadorProcessamento').classList.toggle('ativo',ocup)}catch(e){statusEl.textContent='Falha na comunicação com o painel'}finally{atualizacaoStatusEmAndamento=false;}}
 async function executar(modo){if(modo==='executar'&&!confirm((botoes[0].textContent.includes('Reprocessar')?'Reprocessar somente pendências registradas para ':'Executar a pesquisa real para ')+dia.value+'? Se a cobertura ficar completa, o sistema poderá enviar o e-mail configurado no PROD.'))return;
  botoes.forEach(b=>b.disabled=true);
@@ -275,7 +275,7 @@ setInterval(atualizarHistorico,10000);
     const atual=++versao;
     const diaSelecionado=data.value;
 
-    btnRe.disabled=true;
+    /* Manter estado do botao durante a consulta */
 
     try{
       const resposta=await fetch('/api/situacao_relatorio?data='+
@@ -356,7 +356,7 @@ setInterval(atualizarHistorico,10000);
     }
   });
 
-  data.addEventListener('change',verificar);
+  data.addEventListener('change',()=>{btnRe.disabled=true;btnRun.disabled=true;verificar();});
   btnRun.addEventListener('click',()=>{
     btnRe.disabled=true;
     aviso.textContent='Iniciando monitoramento...';
