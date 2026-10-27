@@ -101,33 +101,72 @@ def consolidar_dia(pasta):
         "erro": palavras.get("erro"),
     })
 
-    comprovante = ler_json(
-        pasta / ("comprovante_relatorio_" + dia + ".json")
-    )
+    # Consulta os comprovantes efetivos do executor atual.
+    comprovantes_email = []
     relatorio_gerado = False
+    pasta_email = pasta / "email_operacional"
 
-    if comprovante and comprovante.get("status") == "GERADO":
-        caminho = pasta / ("relatorio_diario_" + dia + ".txt")
-        if caminho.is_file():
-            digest = hashlib.sha256(caminho.read_bytes()).hexdigest()
-            relatorio_gerado = (
-                digest == comprovante.get("sha256")
-                and comprovante.get("data") == dia
-                and comprovante.get("cobertura_geral") == "PARCIAL"
-            )
+    if pasta_email.is_dir():
+        for arquivo in sorted(pasta_email.glob("envio_*.json")):
+            registro = ler_json(arquivo)
+            if not registro or registro.get("data") != dia:
+                continue
+
+            identificador = registro.get("identificador")
+            if (not isinstance(identificador, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", identificador)
+                    or arquivo.name != "envio_" + identificador + ".json"):
+                continue
+
+            comprovantes_email.append(str(registro.get("status") or "NAO_CONFIRMADO"))
+            anexo = pasta_email / ("relatorio_" + identificador + ".txt")
+
+            try:
+                local = registro.get("anexo")
+                integro = (
+                    isinstance(local, str)
+                    and Path(local).resolve() == anexo.resolve()
+                    and anexo.is_file()
+                    and hashlib.sha256(anexo.read_bytes()).hexdigest()
+                        == str(registro.get("sha256_anexo") or "").lower()
+                )
+            except (OSError, ValueError):
+                integro = False
+
+            relatorio_gerado = relatorio_gerado or integro
+
+    # Mantem compatibilidade com comprovantes antigos.
+    if not relatorio_gerado:
+        comprovante = ler_json(pasta / ("comprovante_relatorio_" + dia + ".json"))
+        if comprovante and comprovante.get("status") == "GERADO":
+            caminho = pasta / ("relatorio_diario_" + dia + ".txt")
+            if caminho.is_file():
+                relatorio_gerado = (
+                    hashlib.sha256(caminho.read_bytes()).hexdigest()
+                    == comprovante.get("sha256")
+                    and comprovante.get("data") == dia
+                    and comprovante.get("cobertura_geral") in ("PARCIAL", "INTEGRAL")
+                )
 
     atividades.append({
         "atividade": "Relatorio diario de pesquisas",
-        "status": (
-            "GERADO" if relatorio_gerado
-            else "GERACAO_NAO_CONFIRMADA"
-        ),
+        "status": "GERADO" if relatorio_gerado else "GERACAO_NAO_CONFIRMADA",
     })
 
-    email = (resumo or {}).get("email") or {}
+    email_resumo = (resumo or {}).get("email") or {}
+
+    if any(s in ("ENVIO_INICIADO", "ENVIO_INDETERMINADO") for s in comprovantes_email):
+        status_email = "ENVIO_INDETERMINADO"
+    elif "ENVIADO" in comprovantes_email:
+        status_email = "ENVIADO"
+    elif "FALHA_ENVIO" in comprovantes_email:
+        status_email = "FALHA_ENVIO"
+    else:
+        status_email = str(email_resumo.get("status") or "NAO_CONFIRMADO")
+
     atividades.append({
         "atividade": "Envio do relatorio por e-mail",
-        "status": str(email.get("status") or "NAO_CONFIRMADO"),
+        "status": status_email,
     })
 
     cobertura = (resumo or {}).get("cobertura_geral")
@@ -144,7 +183,7 @@ def consolidar_dia(pasta):
         "tipo": "PROD",
         "status": str((resumo or {}).get("status") or "REGISTROS_PARCIAIS"),
         "cobertura": cobertura,
-        "email": str(email.get("status") or "NAO_CONFIRMADO"),
+        "email": status_email,
         "atividades": atividades,
     }
 
