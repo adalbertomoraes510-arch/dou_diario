@@ -146,6 +146,41 @@ def obter_caminhos_config(finalidade_config: str) -> dict:
     }
 
 
+
+def assinatura_configuracao_match(finalidade_config: str) -> dict:
+    """Identifica exatamente os arquivos de regras usados pelo MATCH."""
+    import hashlib
+
+    caminhos = obter_caminhos_config(finalidade_config)
+    arquivos = {
+        "config": caminhos["pasta_config"] / "config.json",
+        "palavras_chave": caminhos["palavras_excel"],
+        "exclusoes": caminhos["exclusoes_excel"],
+        "resgates": caminhos["resgates_excel"],
+    }
+
+    hashes = {}
+    for nome, caminho in arquivos.items():
+        if caminho.is_file():
+            hashes[nome] = hashlib.sha256(caminho.read_bytes()).hexdigest()
+        elif nome in ("config", "palavras_chave"):
+            raise FileNotFoundError(
+                "Arquivo obrigatorio ausente: " + str(caminho)
+            )
+        else:
+            hashes[nome] = None
+
+    conteudo = json.dumps(
+        hashes, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")
+    ).encode("utf-8")
+
+    return {
+        "sha256_configuracao": hashlib.sha256(conteudo).hexdigest(),
+        "hashes_arquivos": hashes,
+    }
+
+
 def validar_arquivos_config(caminhos: dict) -> None:
     pasta_config = caminhos["pasta_config"]
     palavras_excel = caminhos["palavras_excel"]
@@ -2465,10 +2500,14 @@ def salvar_resultado_match(
         + total_monitoramento_setorial
     )
 
+    assinatura = assinatura_configuracao_match(finalidade_config)
+
     payload = {
         "data_referencia": data_referencia,
         "finalidade_config": finalidade_config,
         "modelo_planilha": caminhos.get("modelo_planilha"),
+        "sha256_configuracao": assinatura["sha256_configuracao"],
+        "hashes_arquivos_configuracao": assinatura["hashes_arquivos"],
         "pasta_config": str(caminhos.get("pasta_config")),
         "arquivo_palavras_chave": str(caminhos.get("palavras_excel")),
         "arquivo_exclusoes": str(caminhos.get("exclusoes_excel")),

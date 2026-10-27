@@ -167,41 +167,99 @@ async def coletar_dou_por_inlabs(dia):
 
 
 def contingencia_v7(dia, processos, destino):
-    """Motor V7 de processos; cobertura validada; resultados candidatos por processo."""
+    """Pesquisa V7 com cobertura comprovada individualmente."""
     from backend.operacao.services.adaptador_motor_v7 import pesquisar_processos
-    resposta=pesquisar_processos(
-        processos=[{'processo':p} for p in processos],
-        data_inicial=dia,data_final=dia,modo_navegador='oculto')
-    auditoria=resposta.get('auditoria') or []
-    paginacao=resposta.get('paginacao') or []
-    falhas=resposta.get('falhas') or []
-    concluido=(str(resposta.get('estado') or '').lower()=='concluido'
-          and len(auditoria)==len(processos) and len(paginacao)==len(processos)
-          and not falhas and all(isinstance(p,dict) and p.get('completa') is True for p in paginacao))
-    busca={id_processo(p):p for p in processos}
-    normalizados=[]
+
+    resposta = pesquisar_processos(
+        processos=[{'processo': p} for p in processos],
+        data_inicial=dia, data_final=dia, modo_navegador='oculto'
+    )
+
+    busca = {id_processo(p): p for p in processos}
+    auditoria = resposta.get('auditoria') or []
+    paginacao = resposta.get('paginacao') or []
+    falhas = resposta.get('falhas') or []
+
+    def indexar_unicos(registros):
+        indice = {}
+        duplicados = set()
+        for item in registros:
+            if not isinstance(item, dict):
+                continue
+            chave = id_processo(item.get('processo'))
+            if not chave:
+                continue
+            if chave in indice:
+                duplicados.add(chave)
+            indice[chave] = item
+        return indice, duplicados
+
+    indice_auditoria, duplicados_auditoria = indexar_unicos(auditoria)
+    indice_paginacao, duplicados_paginacao = indexar_unicos(paginacao)
+    processos_com_falha = {
+        id_processo(item.get('processo'))
+        for item in falhas if isinstance(item, dict)
+    }
+
+    estado = str(resposta.get('estado') or '').lower()
+    if estado not in ('concluido', 'parcial'):
+        processos_comprovados = set()
+    else:
+        processos_comprovados = {
+            chave for chave in busca
+            if chave in indice_auditoria
+            and chave in indice_paginacao
+            and chave not in duplicados_auditoria
+            and chave not in duplicados_paginacao
+            and chave not in processos_com_falha
+            and indice_paginacao[chave].get('completa') is True
+            and not indice_paginacao[chave].get('problemas')
+            and int(indice_paginacao[chave].get('paginas_visitadas') or 0) > 0
+            and str(indice_auditoria[chave].get('inicio') or '') == dia.isoformat()
+            and str(indice_auditoria[chave].get('fim') or '') == dia.isoformat()
+        }
+
+    normalizados = []
     for item in resposta.get('resultados') or []:
-        if not isinstance(item,dict): continue
-        numeros=item.get('processos') or ([item.get('processo')] if item.get('processo') else [])
-        if not isinstance(numeros,list): numeros=[numeros]
+        if not isinstance(item, dict):
+            continue
+        numeros = item.get('processos') or (
+            [item.get('processo')] if item.get('processo') else []
+        )
+        if not isinstance(numeros, list):
+            numeros = [numeros]
         for numero in numeros:
-            ident=id_processo(numero)
-            if ident not in busca:continue
-            registro=dict(item)
-            registro.update({'processo':busca[ident],
-                'trecho':str(item.get('resumo') or item.get('trecho') or ''),
-                'tipo_match':'CANDIDATO_CONTINGENCIA_V7'})
+            ident = id_processo(numero)
+            if ident not in processos_comprovados:
+                continue
+            registro = dict(item)
+            registro.update({
+                'processo': busca[ident],
+                'trecho': str(item.get('resumo') or item.get('trecho') or ''),
+                'tipo_match': 'CANDIDATO_CONTINGENCIA_V7'
+            })
             normalizados.append(registro)
-    comprovante=dict(resposta)
-    comprovante['resultados_normalizados']=normalizados
-    comprovante['cobertura_processos_comprovada']=concluido
-    arquivo=destino/'evidencias'/'dou_v7_completo.json'
+
+    comprovados = tuple(p for p in processos
+                        if id_processo(p) in processos_comprovados)
+    pendentes = tuple(p for p in processos
+                      if id_processo(p) not in processos_comprovados)
+
+    comprovante = dict(resposta)
+    comprovante['resultados_normalizados'] = normalizados
+    comprovante['cobertura_processos_comprovada'] = not pendentes
+    comprovante['processos_comprovados'] = list(comprovados)
+    comprovante['processos_pendentes'] = list(pendentes)
+
+    arquivo = destino/'evidencias'/'dou_v7_completo.json'
     if arquivo.exists():
-        arquivo=destino/'evidencias'/('dou_v7_'+dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.json')
-    guardar_atomico(arquivo,comprovante)
-    if not concluido:
-        raise RuntimeError('V7 sem cobertura individual comprovada; prova: '+str(arquivo))
-    return arquivo,normalizados
+        arquivo = destino/'evidencias'/(
+            'dou_v7_' + dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.json'
+        )
+    guardar_atomico(arquivo, comprovante)
+
+    return arquivo, normalizados, comprovados, pendentes
+
 
 def executar_dou(dia, processos, pasta, reg):
     """Pesquisa da data; INLABS e palavras-chave, base local, V7 processos.
@@ -269,12 +327,30 @@ def executar_dou(dia, processos, pasta, reg):
         except Exception as exc:
             erros.append('BASE_DOU: '+str(exc))
     try:
-        arquivo, resultados=contingencia_v7(dia,faltantes,pasta.parent)
-        ev={'referencia':str(arquivo),'sha256':sha256(arquivo),
-            'processos_pesquisados':list(faltantes)}
-        registrar_em_lote(reg,data,faltantes,'DOU','SEGUNDO_RESULTADOS',
-            origem='SITE_DOU',evidencia=ev,resultados=resultados,pasta=pasta)
-        print('[DOU] Contingencia V7 concluiu processos:',len(faltantes))
+        arquivo, resultados, comprovados, pendentes = contingencia_v7(
+            dia, faltantes, pasta.parent
+        )
+        if comprovados:
+            ev = {
+                'referencia': str(arquivo),
+                'sha256': sha256(arquivo),
+                'processos_pesquisados': list(comprovados)
+            }
+            registrar_em_lote(
+                reg, data, comprovados, 'DOU', 'SEGUNDO_RESULTADOS',
+                origem='SITE_DOU', evidencia=ev,
+                resultados=resultados, pasta=pasta
+            )
+        if pendentes:
+            registrar_em_lote(
+                reg, data, pendentes, 'DOU', reg.STATUS_FALHA,
+                origem='SITE_DOU',
+                erro='Contingencia V7 sem cobertura individual comprovada: '
+                     + str(arquivo),
+                pasta=pasta
+            )
+        print('[DOU] V7 comprovados:', len(comprovados),
+              'pendentes:', len(pendentes))
     except Exception as exc:
         erros.append('CONTINGENCIA_V7: '+str(exc))
         registrar_em_lote(reg,data,faltantes,'DOU',reg.STATUS_FALHA,
@@ -503,14 +579,205 @@ def configuracao_email_prod():
     return list(dict.fromkeys(valores))
 
 
+def evidencia_processo_valida(dia, pasta, numero, fonte, registro):
+    """Valida evidencia documental individual antes de autorizar email."""
+    evidencia = registro.get('evidencia')
+    if not isinstance(evidencia, dict):
+        return False
+
+    referencia = evidencia.get('referencia')
+    digest = evidencia.get('sha256')
+    if not referencia or not digest:
+        return False
+
+    arquivo = Path(referencia)
+    try:
+        if not arquivo.is_file():
+            return False
+        if not arquivo.resolve().is_relative_to(pasta.parent.resolve()):
+            return False
+        if sha256(arquivo) != digest:
+            return False
+
+        dados = json.loads(arquivo.read_text(encoding='utf-8-sig'))
+        processo = id_processo(numero)
+
+        if fonte in FONTES[1:]:
+            diagnosticos = dados.get('diagnosticos')
+            if not isinstance(diagnosticos, list) or not diagnosticos:
+                return False
+
+            tipo = 'atas' if fonte == 'ANVISA_DICOL_ATAS' else 'pautas'
+            # Acervo da mesma instalacao que produziu a evidencia.
+            # Ex.: .../processos_2026/monitoramento_diario_operacional/DATA/evidencias
+            #      .../processos_2026/acervo_dicol_permanente/TIPO
+            if arquivo.parent.name != 'evidencias':
+                return False
+            if arquivo.parent.parent.name != dia:
+                return False
+            if arquivo.parent.parent.parent.name != 'monitoramento_diario_operacional':
+                return False
+
+            acervo = (
+                arquivo.parent.parent.parent.parent
+                / 'acervo_dicol_permanente' / tipo
+            )
+
+            for item in diagnosticos:
+                if not isinstance(item, dict):
+                    return False
+                if item.get('status') != 'PESQUISADO':
+                    return False
+
+                digest_pdf = item.get('sha256_pdf')
+                caminho_pdf = item.get('arquivo_permanente')
+
+                if not isinstance(digest_pdf, str) or len(digest_pdf) != 64:
+                    return False
+                if not caminho_pdf:
+                    return False
+
+                pdf = Path(caminho_pdf)
+                if not pdf.is_file():
+                    return False
+                if not pdf.resolve().is_relative_to(acervo.resolve()):
+                    return False
+                if sha256(pdf) != digest_pdf:
+                    return False
+
+
+            pesquisados = {
+                id_processo(p) for p in dados.get('processos_pesquisados', [])
+            }
+            diagnosticos = dados.get('diagnosticos') or []
+
+            return (
+                dados.get('data') == dia
+                and processo in pesquisados
+                and dados.get('consulta_diaria_ok') is True
+                and dados.get('pesquisa_acervo_ok') is True
+                and not dados.get('falhas_catalogo')
+                and not dados.get('falhas_acervo')
+                and bool(diagnosticos)
+                and all(d.get('status') == 'PESQUISADO'
+                        for d in diagnosticos)
+                and dados.get('documentos_acervo') == len(diagnosticos)
+                and dados.get('documentos_catalogo') > 0
+            )
+
+        if fonte == 'DOU':
+            if not isinstance(dados, dict):
+                return False
+
+            # Pesquisa pela base local validada do DOU.
+            if dados.get('origem') == 'BASE_DOU_VALIDA':
+                pesquisados = {
+                    id_processo(p)
+                    for p in dados.get('processos_pesquisados', [])
+                }
+                base = Path(str(dados.get('base') or ''))
+                digest_base = dados.get('sha256_base')
+
+                return (
+                    dados.get('data_referencia') == dia
+                    and processo in pesquisados
+                    and bool(digest_base)
+                    and base.is_file()
+                    and sha256(base) == digest_base
+                    and isinstance(dados.get('resultados'), list)
+                )
+
+            # Pesquisa por processo na contingencia V7.
+            # A execucao pode ser parcial, mas cada processo
+            # aprovado precisa ter comprovacao independente.
+            if 'auditoria' not in dados or 'paginacao' not in dados:
+                return False
+
+            if str(dados.get('estado') or '').lower() not in (
+                'concluido', 'parcial'
+            ):
+                return False
+
+            auditorias = [
+                item for item in dados.get('auditoria', [])
+                if isinstance(item, dict)
+                and id_processo(item.get('processo')) == processo
+            ]
+            paginacoes = [
+                item for item in dados.get('paginacao', [])
+                if isinstance(item, dict)
+                and id_processo(item.get('processo')) == processo
+            ]
+            falhas = [
+                item for item in dados.get('falhas', [])
+                if isinstance(item, dict)
+                and id_processo(item.get('processo')) == processo
+            ]
+
+            if len(auditorias) != 1 or len(paginacoes) != 1 or falhas:
+                return False
+
+            auditoria = auditorias[0]
+            paginacao = paginacoes[0]
+
+            return (
+                auditoria.get('inicio') == dia
+                and auditoria.get('fim') == dia
+                and paginacao.get('completa') is True
+                and not paginacao.get('problemas')
+                and isinstance(paginacao.get('paginas_visitadas'), int)
+                and paginacao['paginas_visitadas'] > 0
+                and (
+                    not dados.get('processos_comprovados')
+                    or processo in {
+                        id_processo(p)
+                        for p in dados['processos_comprovados']
+                    }
+                )
+            )
+
+        return False
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
 def preparar_relatorio_email(dia, pasta, reg):
     """Inclui SEMPRE os 36 processos e suas tres fontes. Nao infere completude."""
     documento = json.loads(reg.caminho_dia(dia, pasta).read_text(encoding='utf-8-sig'))
     resumo = resumo_grade(documento)
-    completo = all(
-        estado in reg.STATUS_CONCLUIDOS
-        for estados in resumo.values() for estado in estados
-    ) and _palavras_chave_comprovadas(pasta)[0]
+    # Falha fechada: nenhuma pendencia ou prova ausente libera email.
+    completo = False
+    try:
+        carteira = carteira_validada()
+        esperados = {id_processo(p) for p in carteira}
+        encontrados = documento.get('processos')
+
+        if (
+            isinstance(encontrados, dict)
+            and bool(esperados)
+            and set(encontrados) == esperados
+            and documento.get('data_pesquisa') == dia
+        ):
+            completo = all(
+                isinstance(encontrados[numero], dict)
+                and isinstance(encontrados[numero].get('fontes'), dict)
+                and all(
+                    isinstance(encontrados[numero]['fontes'].get(fonte), dict)
+                    and encontrados[numero]['fontes'][fonte].get('status')
+                    in reg.STATUS_CONCLUIDOS
+                    and evidencia_processo_valida(
+                        dia, pasta, numero, fonte,
+                        encontrados[numero]['fontes'][fonte]
+                    )
+                    for fonte in FONTES
+                )
+                for numero in esperados
+            )
+            if completo:
+                completo = _palavras_chave_comprovadas(pasta)[0]
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+        print('[EMAIL] Cobertura nao comprovada:', str(exc)[:300])
+        completo = False
     linhas = []
     campos_assinatura = []
     for numero, info in sorted(documento['processos'].items()):
@@ -562,14 +829,50 @@ def _linhas_publicacoes_provas(linhas,pasta):
 
 
 def _palavras_chave_comprovadas(pasta):
-    arquivo=pasta.parent/'evidencias'/'dou_inlabs_palavras_chave.json'
-    if not arquivo.is_file():return (False,[], 'INLABS sem comprovante das palavras-chave')
-    dados=json.loads(arquivo.read_text(encoding='utf-8-sig'))
-    if dados.get('status')!='PESQUISADO':
-        return (False,[],str(dados.get('erro') or 'INLABS nao concluiu as palavras-chave'))
-    lista=dados.get('publicacoes_palavras_chave') or []
-    if not isinstance(lista,list):raise RuntimeError('Relatorio palavras-chave invalido')
-    return (True,lista,'')
+    """Exige comprovante INLABS e integridade dos relatorios originais."""
+    arquivo = pasta.parent/'evidencias'/'dou_inlabs_palavras_chave.json'
+
+    try:
+        if not arquivo.is_file():
+            return False, [], 'INLABS sem comprovante das palavras-chave'
+
+        dados = json.loads(arquivo.read_text(encoding='utf-8-sig'))
+        if not isinstance(dados, dict):
+            return False, [], 'Comprovante INLABS invalido'
+
+        if dados.get('status') != 'PESQUISADO':
+            return False, [], str(
+                dados.get('erro') or 'INLABS nao concluiu as palavras-chave'
+            )
+
+        if dados.get('origem') != 'INLABS':
+            return False, [], 'Origem INLABS nao comprovada'
+
+        if dados.get('data') != pasta.parent.name:
+            return False, [], 'Data do comprovante INLABS divergente'
+
+        lista = dados.get('publicacoes_palavras_chave')
+        if not isinstance(lista, list):
+            return False, [], 'Lista de palavras-chave invalida'
+
+        for campo, campo_hash in (
+            ('modelo_json', 'sha256_modelo'),
+            ('relatorio_txt', 'sha256_relatorio')
+        ):
+            referencia = dados.get(campo)
+            digest = dados.get(campo_hash)
+
+            if not referencia or not isinstance(digest, str) or len(digest) != 64:
+                return False, [], 'Arquivo ou hash INLABS ausente: ' + campo
+
+            origem = Path(referencia)
+            if not origem.is_file() or sha256(origem) != digest:
+                return False, [], 'Integridade INLABS invalida: ' + campo
+
+        return True, lista, ''
+
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return False, [], 'Falha na validacao INLABS: ' + str(exc)[:200]
 
 
 
@@ -762,6 +1065,9 @@ def enviar_relatorio_operacional_dev(dia, pasta, reg):
         print('[EMAIL] BLOQUEADO: envio PROD ainda nao habilitado.')
         return {'status':'BLOQUEADO_CONFIGURACAO_EMAIL_PROD'}
     resumo, completo, linhas, assinaturas = preparar_relatorio_email(dia, pasta, reg)
+    if not completo:
+        print('[EMAIL] BLOQUEADO: existem pesquisas obrigatorias incompletas.')
+        return {'status': 'EMAIL_BLOQUEADO_PENDENCIAS'}
     classificacao, texto, html = montar_mensagem_email(dia, resumo, completo, linhas, pasta)
     assinatura_bytes = json.dumps(
         {'data':dia,'destinatarios':sorted(e.casefold() for e in email),'versao':6,'grade':assinaturas,'conteudo_email':hashlib.sha256((texto+html).encode('utf-8')).hexdigest()},
@@ -907,7 +1213,11 @@ def main(argv=None):
                 'Sem revisao historica, sem promover status e sem processamento de periodo.',
                 'DOU pesquisa processos por base valida ou V7, demais palavras-chave somente via INLABS.']})
         print('RESUMO:',saida)
-        email_resultado = enviar_relatorio_operacional_dev(dia.isoformat(),grade,reg)
+        if cobertura_integral:
+            email_resultado = enviar_relatorio_operacional_dev(dia.isoformat(),grade,reg)
+        else:
+            print('[EMAIL] BLOQUEADO NO EXECUTOR: cobertura obrigatoria parcial.')
+            email_resultado = {'status':'EMAIL_BLOQUEADO_PENDENCIAS'}
         print('STATUS_EMAIL:',email_resultado.get('status'))
         guardar_atomico(saida, {**json.loads(saida.read_text(encoding='utf-8-sig')), 'email':email_resultado})
         if email_resultado.get('status') != 'ENVIADO':

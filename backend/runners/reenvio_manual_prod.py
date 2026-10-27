@@ -113,6 +113,11 @@ def reenviar(dia):
             runner.preparar_relatorio_email(dia, grade, reg)
         )
 
+        if not completo:
+            raise RuntimeError(
+                "REENVIO BLOQUEADO: pesquisas obrigatorias incompletas."
+            )
+
         assunto, texto, html = runner.montar_mensagem_email(
             dia, resumo, completo, linhas, grade
         )

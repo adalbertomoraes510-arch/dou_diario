@@ -28,6 +28,7 @@ from backend.services.base_publicacoes_service import (
 from backend.services.match_service import (
     aplicar_match_base,
     salvar_resultado_match,
+    assinatura_configuracao_match,
 )
 from backend.services.auditoria_match_service import (
     gerar_auditoria_match,
@@ -768,11 +769,24 @@ async def executar_match(
 
     caminho = caminhos["match"]
 
+    assinatura_atual = assinatura_configuracao_match(finalidade_config)
+
     if caminho.exists() and not forcar_reprocessamento:
         payload_existente = carregar_json(caminho)
         registros_match = extrair_registros_match(payload_existente)
 
-        if registros_match or not registros:
+        assinatura_confere = (
+            isinstance(payload_existente, dict)
+            and payload_existente.get("sha256_configuracao")
+                == assinatura_atual["sha256_configuracao"]
+            and payload_existente.get("data_referencia")
+                == data_execucao.isoformat()
+            and payload_existente.get("finalidade_config")
+                == finalidade_config
+            and len(registros_match) == len(registros)
+        )
+
+        if assinatura_confere and (registros_match or not registros):
             total_com_match = sum(
                 1 for r in registros_match
                 if r.get("status_match") == "COM_MATCH"
@@ -871,6 +885,7 @@ async def executar_match(
         },
     )
 
+    payload_match["match_recalculado"] = True
     return payload_match
 
 
@@ -1305,12 +1320,19 @@ async def executar_pipeline_finalidade_dou(
             finalidade_config=finalidade_config,
             payload_match=payload_match,
             status_execucao=status_execucao,
-            forcar_reprocessamento=forcar_reprocessamento_finalidade,
+            forcar_reprocessamento=(
+                forcar_reprocessamento_finalidade
+                or payload_match.get("match_recalculado", False)
+            ),
         )
 
         # Quando a base atual possui registros, regeneramos o relatório para evitar
         # reutilização de relatório antigo criado com base zerada.
-        forcar_relatorio = forcar_reprocessamento_finalidade or len(registros) > 0
+        forcar_relatorio = (
+            forcar_reprocessamento_finalidade
+            or payload_match.get("match_recalculado", False)
+            or len(registros) > 0
+        )
 
         arquivos_relatorio = await executar_relatorio_executivo(
             data_execucao=data_execucao,
