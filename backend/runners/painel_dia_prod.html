@@ -114,17 +114,21 @@ main{max-width:1400px;margin:18px auto;padding:0 12px}h1{font-size:26px;margin-b
 <script>
 const dia=document.querySelector('#dia'), statusEl=document.querySelector('#status'), saida=document.querySelector('#saida');
 const botoes=[document.querySelector('#btnRun')];
-async function atualizar(){try{const r=await fetch('/api/status',{cache:'no-store'});const j=await r.json();statusEl.textContent=j.status+(j.data?' — '+j.data:'');saida.textContent=j.saida||'Sem saída ainda';saida.scrollTop=saida.scrollHeight;const ocup=j.status==='EM_EXECUCAO';
+let atualizacaoStatusEmAndamento=false;
+async function atualizar(){
+if(atualizacaoStatusEmAndamento)return;
+atualizacaoStatusEmAndamento=true;
+try{const r=await fetch('/api/status',{cache:'no-store'});const j=await r.json();statusEl.textContent=j.status+(j.data?' — '+j.data:'');saida.textContent=j.saida||'Sem saída ainda';saida.scrollTop=saida.scrollHeight;const ocup=j.status==='EM_EXECUCAO';
 botoes.forEach(b=>b.disabled=ocup);
 dia.disabled=ocup;
-document.querySelector('#indicadorProcessamento').classList.toggle('ativo',ocup)}catch(e){statusEl.textContent='Falha na comunicação com o painel'}}
+document.querySelector('#indicadorProcessamento').classList.toggle('ativo',ocup)}catch(e){statusEl.textContent='Falha na comunicação com o painel'}finally{atualizacaoStatusEmAndamento=false;}}
 async function executar(modo){if(modo==='executar'&&!confirm((botoes[0].textContent.includes('Reprocessar')?'Reprocessar somente pendências registradas para ':'Executar a pesquisa real para ')+dia.value+'? Se a cobertura ficar completa, o sistema poderá enviar o e-mail configurado no PROD.'))return;
  botoes.forEach(b=>b.disabled=true);
 dia.disabled=true;
 document.querySelector('#indicadorProcessamento').classList.add('ativo');
 statusEl.textContent='PROCESSAMENTO EM ANDAMENTO';
 try{const r=await fetch('/api/executar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:dia.value,modo})});const j=await r.json();if(!r.ok){alert(j.erro||'Erro ao iniciar');await atualizar();return;}await atualizar();}catch(e){alert('Falha: '+e);await atualizar();}}
-botoes[0].onclick=()=>executar('executar');atualizar();setInterval(atualizar,2500);
+botoes[0].onclick=()=>executar('executar');atualizar();setInterval(atualizar,15000);
 
 const historicoEl=document.querySelector('#historico');
 const escapar=s=>String(s??'').replace(/[&<>"']/g,c=>({
