@@ -263,26 +263,24 @@ setInterval(atualizarHistorico,10000);
   let versao=0;
   let bloqueioLocal=false;
   let execucaoOcupada=false;
+  let consultaEmAndamento=false;
 
   async function verificar(){
+    if(consultaEmAndamento)return;
+    consultaEmAndamento=true;
     const atual=++versao;
     const diaSelecionado=data.value;
 
     btnRe.disabled=true;
 
     try{
-      const [resposta,statusResposta]=await Promise.all([
-        fetch('/api/situacao_relatorio?data='+
-          encodeURIComponent(diaSelecionado),{cache:'no-store'}),
-        fetch('/api/status',{cache:'no-store'})
-      ]);
-
+      const resposta=await fetch('/api/situacao_relatorio?data='+
+        encodeURIComponent(diaSelecionado),{cache:'no-store'});
       const info=await resposta.json();
-      const execucao=await statusResposta.json();
 
       if(atual!==versao || data.value!==diaSelecionado)return;
 
-      const ocupado=execucao.status==='EM_EXECUCAO';
+      const ocupado=document.querySelector('#status').textContent.startsWith('EM_EXECUCAO');
       execucaoOcupada=ocupado;
 
       data.disabled=ocupado || bloqueioLocal;
@@ -305,6 +303,8 @@ setInterval(atualizarHistorico,10000);
       if(atual!==versao)return;
       btnRe.disabled=true;
       aviso.textContent='Falha ao consultar a situacao do relatorio';
+    }finally{
+      consultaEmAndamento=false;
     }
   }
 
@@ -359,7 +359,7 @@ setInterval(atualizarHistorico,10000);
   });
 
   verificar();
-  setInterval(verificar,2500);
+  setInterval(verificar,12000);
 })();
 </script>
 </body></html>
